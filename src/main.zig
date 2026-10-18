@@ -1,5 +1,8 @@
 const std = @import("std");
 const c = @import("c");
+const editor = @import("editor.zig");
+const terminal = @import("terminal.zig");
+const render = @import("render.zig");
 
 // Helper to call lua_tolstring and get string
 inline fn luaToString(L: *c.lua_State, idx: c_int) ?[*:0]const u8 {
@@ -43,6 +46,13 @@ pub fn main(init: std.process.Init) !void {
 
     if (lua_script) |script_path| {
         try runLuaScript(script_path, gpa, io, arena);
+    } else {
+        // Editor mode - open file if provided, otherwise start empty
+        var filename: ?[]const u8 = null;
+        if (i < args.len) {
+            filename = args[i];
+        }
+        try runEditor(gpa, io, filename);
     }
 }
 
@@ -709,5 +719,51 @@ fn writeAllStdout(data: []const u8) void {
         const rc = std.c.write(std.posix.STDOUT_FILENO, data[offset..].ptr, data.len - offset);
         if (rc < 0) return;
         offset += @intCast(rc);
+    }
+}
+
+fn runEditor(allocator: std.mem.Allocator, io: std.Io, filename: ?[]const u8) !void {
+    var term = try terminal.Terminal.init();
+    try term.enableRawMode();
+    defer term.disableRawMode() catch {};
+
+    var ed = try editor.Editor.init(allocator);
+    defer ed.deinit();
+
+    ed.screen_rows = term.screen_rows;
+    ed.screen_cols = term.screen_cols;
+
+    if (filename) |fname| {
+        ed.openFile(io, fname) catch |err| {
+            ed.setStatusMsg("Error: {}", .{err});
+        };
+    }
+
+    // Main loop
+    while (true) {
+        render.render(&ed, &term);
+
+        const key = terminal.Terminal.readKey() catch continue;
+
+        switch (key) {
+            1000 => ed.moveCursor(.home), // Home
+            1001 => ed.moveCursor(.end), // End
+            1002 => ed.moveCursor(.page_up), // Page Up
+            1003 => ed.moveCursor(.page_down), // Page Down
+            1004 => ed.moveCursor(.up), // Up
+            1005 => ed.moveCursor(.down), // Down
+            1006 => ed.moveCursor(.right), // Right
+            1007 => ed.moveCursor(.left), // Left
+            13 => try ed.insertNewline(), // Enter
+            127 => ed.deleteChar(), // Backspace
+            27 => {}, // Escape (ignore for now)
+            else => |k| {
+                if (k < 32 or k >= 127) continue;
+                const ch: u8 = @intCast(k & 0xFF);
+                try ed.insertChar(ch);
+            },
+        }
+
+        ed.scroll();
     }
 }

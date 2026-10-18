@@ -20,7 +20,8 @@ for task in "$ROOT/tasks"/TASK-*.md; do
   
   # Check if test passes
   if [[ -f "$ROOT/cases/$name.lua" ]]; then
-    if python3 "$DIR/oracle.py" --test "$ROOT/cases/$name.lua" "${@:+--zigvim}" "${@:-}" 2>/dev/null; then
+    ZIGVIM="${ZIGVIM:-$ROOT/zig-out/bin/zigvim}"
+    if python3 "$DIR/oracle.py" --test "$ROOT/cases/$name.lua" --zigvim "$ZIGVIM" "$@" 2>/dev/null; then
       ((pass++))
       echo "✅ $name: PASS"
     else

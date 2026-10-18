@@ -11,9 +11,10 @@ TASK="$1"; shift || { echo "usage: $0 <task|all>"; exit 1; }
 
 if [[ "$TASK" == "all" ]]; then
   pass=0; fail=0; err=0
+  ZIGVIM="${ZIGVIM:-$ROOT/zig-out/bin/zigvim}"
   for f in "$ROOT/cases"/TASK-*.lua; do
     name=$(basename "$f" .lua)
-    if python3 "$DIR/oracle.py" --test "$f" "${@:+--zigvim}" "${@:-}" 2>/dev/null; then
+    if python3 "$DIR/oracle.py" --test "$f" --zigvim "$ZIGVIM" "$@" 2>/dev/null; then
       ((pass++)); echo "  PASS $name"
     else
       ((fail++)); echo "  FAIL $name"
