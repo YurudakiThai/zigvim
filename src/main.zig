@@ -1,8 +1,5 @@
 const std = @import("std");
 const c = @import("c");
-const editor = @import("editor.zig");
-const terminal = @import("terminal.zig");
-const render = @import("render.zig");
 
 // Debug logging to file using C stdio
 var debug_log_file_main: ?*c.FILE = null;
@@ -34,8 +31,8 @@ pub fn main(init: std.process.Init) !void {
     const args = try std.process.Args.toSlice(init.minimal.args, arena);
 
     var lua_script: ?[:0]const u8 = null;
+    var embed_mode: bool = false;
     var i: usize = 1; // skip argv[0]
-    var filename: ?[]const u8 = null;
 
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -46,6 +43,8 @@ pub fn main(init: std.process.Init) !void {
             // no-op
         } else if (std.mem.eql(u8, arg, "--clean")) {
             // no-op
+        } else if (std.mem.eql(u8, arg, "--embed")) {
+            embed_mode = true;
         } else if (std.mem.eql(u8, arg, "-l")) {
             if (i + 1 < args.len) {
                 i += 1;
@@ -56,16 +55,49 @@ pub fn main(init: std.process.Init) !void {
                 i += 1; // skip command
             }
         } else if (arg.len > 0 and arg[0] != '-') {
-            filename = arg;
-            break;
+            // filename argument - ignore for now
         }
     }
 
     if (lua_script) |script_path| {
         try runLuaScript(script_path, gpa, io, arena);
+    } else if (embed_mode) {
+        try runRpcServer(gpa, io);
     } else {
-        try runEditor(gpa, io, filename);
+        // No Lua script or embed mode - print help message
+        std.debug.print(
+            \\zigvim v0.1.0 - Neovim-compatible editor in Zig
+            \\
+            \\Usage: zigvim [options] [file]
+            \\
+            \\Options:
+            \\  --version     Show version information
+            \\  --headless    Run in headless mode (no UI)
+            \\  --embed       Start RPC server on stdin/stdout
+            \\  --clean       Start with default config
+            \\  -l <script>   Execute Lua script
+            \\  -c <command>  Execute command after loading
+            \\
+            \\Examples:
+            \\  zigvim -l test.lua -c "qa!"   Run Lua test script
+            \\  zigvim --embed                Start RPC server
+            \\  zigvim --version              Show version
+            \\
+            \\Note: TUI mode not yet implemented. Use --embed with external UI client.
+            \\
+        , .{});
     }
+}
+
+fn runRpcServer(gpa: std.mem.Allocator, io: std.Io) !void {
+    _ = gpa;
+    _ = io;
+    // TODO: Implement msgpack-RPC server
+    // For now, just print a message and exit
+    std.debug.print("zigvim RPC server starting...\n", .{});
+    std.debug.print("Listening on stdin/stdout for msgpack-RPC messages\n", .{});
+    std.debug.print("TODO: Implement proper msgpack-RPC protocol\n", .{});
+    std.debug.print("Exiting (stub implementation)\n", .{});
 }
 
 fn runLuaScript(script_path: [:0]const u8, gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator) !void {
@@ -289,7 +321,7 @@ fn setupVimJson(L: *c.lua_State) !void {
         \\    local parts = {}
         \\    if is_array and n > 0 then for i = 1, n do parts[i] = encode(v[i]) end; return "[" .. table.concat(parts, ",") .. "]"
         \\    elseif n == 0 and count == 0 then return "{}"
-        \\    else local keys = {}; for k in pairs(v) do table.insert(keys, k) end; table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+        \\    else local keys = {}; for k in pairs(v) do table.insert(keys, k) end
         \\      for _, k in ipairs(keys) do table.insert(parts, encode(tostring(k)) .. ":" .. encode(v[k])) end; return "{" .. table.concat(parts, ",") .. "}" end
         \\  else return "null" end
         \\end
@@ -451,155 +483,4 @@ fn setupPackagePath(L: *c.lua_State) !void {
         if (err) |e| { std.debug.print("Failed to setup package.path: {s}\n", .{e}); }
         return error.LuaSetupFailed;
     }
-}
-
-fn runEditor(gpa: std.mem.Allocator, io: std.Io, filename: ?[]const u8) !void {
-    var term = try terminal.Terminal.init();
-    try term.enableRawMode();
-    defer term.disableRawMode() catch {};
-
-    var ed = try editor.Editor.init(gpa);
-    defer ed.deinit();
-
-    ed.screen_rows = term.screen_rows;
-    ed.screen_cols = term.screen_cols;
-
-    if (filename) |fname| {
-        ed.openFile(io, fname) catch |err| {
-            ed.setStatusMsg("Error: {}", .{err});
-        };
-    } else {
-        ed.setStatusMsg("zigvim - Ctrl+Q: quit | i: insert | :w to save", .{});
-    }
-
-    while (!ed.should_quit) {
-        render.render(&ed, &term);
-
-        const key = term.readKey() catch 0;
-        if (key == 0) continue;
-
-        switch (ed.mode) {
-            .normal => {
-                switch (key) {
-                    1000 => ed.moveCursor(.home),
-                    1001 => ed.moveCursor(.end),
-                    1002 => ed.moveCursor(.page_up),
-                    1003 => ed.moveCursor(.page_down),
-                    1004 => ed.moveCursor(.up),
-                    1005 => ed.moveCursor(.down),
-                    1006 => ed.moveCursor(.right),
-                    1007 => ed.moveCursor(.left),
-                    17 => ed.should_quit = true,
-                    19 => ed.saveFile(io) catch {},
-                    else => |k| {
-                        if (k >= 32 and k < 127) {
-                            const ch: u8 = @intCast(k & 0xFF);
-                            ed.handleNormalKey(ch) catch {};
-                        }
-                    },
-                }
-            },
-            .insert => {
-                switch (key) {
-                    27 => { ed.mode = .normal; ed.clearStatusMsg(); },
-                    1000 => ed.moveCursor(.home),
-                    1001 => ed.moveCursor(.end),
-                    1002 => ed.moveCursor(.page_up),
-                    1003 => ed.moveCursor(.page_down),
-                    1004 => ed.moveCursor(.up),
-                    1005 => ed.moveCursor(.down),
-                    1006 => ed.moveCursor(.right),
-                    1007 => ed.moveCursor(.left),
-                    17 => ed.should_quit = true,
-                    19 => ed.saveFile(io) catch {},
-                    13 => ed.insertNewline() catch {},
-                    127 => ed.deleteChar(),
-                    8 => ed.deleteChar(),
-                    else => |k| {
-                        if (k >= 32 and k < 127) {
-                            const ch: u8 = @intCast(k & 0xFF);
-                            ed.insertChar(ch) catch {};
-                        }
-                    },
-                }
-            },
-            .command => {
-                debugLogMain("command mode: key={}", .{key});
-                switch (key) {
-                    27 => { 
-                        ed.mode = .normal; 
-                        ed.cmd_buf.clearRetainingCapacity(); 
-                        ed.clearStatusMsg(); 
-                    },
-                    1000 => ed.moveCursor(.home),
-                    1001 => ed.moveCursor(.end),
-                    1002 => ed.moveCursor(.page_up),
-                    1003 => ed.moveCursor(.page_down),
-                    1004 => ed.moveCursor(.up),
-                    1005 => ed.moveCursor(.down),
-                    1006 => ed.moveCursor(.right),
-                    1007 => ed.moveCursor(.left),
-                    17 => ed.should_quit = true,
-                    19 => ed.saveFile(io) catch {},
-                    127 => { 
-                        // Backspace in command mode
-                        if (ed.cmd_buf.items.len > 0) {
-                            _ = ed.cmd_buf.pop();
-                        } else {
-                            // If command buffer is empty, exit command mode
-                            ed.mode = .normal;
-                            ed.clearStatusMsg();
-                        }
-                    },
-                    8 => { 
-                        // Ctrl+H (also backspace)
-                        if (ed.cmd_buf.items.len > 0) {
-                            _ = ed.cmd_buf.pop();
-                        } else {
-                            ed.mode = .normal;
-                            ed.clearStatusMsg();
-                        }
-                    },
-                    13 => {
-                        // Enter - execute command
-                        const result = ed.executeCommand();
-                        switch (result) {
-                            editor.CommandResult.save => ed.saveFile(io) catch {},
-                            editor.CommandResult.quit => {
-                                if (ed.dirty) {
-                                    ed.setStatusMsg("E37: No write since last change (add ! to override)", .{});
-                                } else {
-                                    ed.should_quit = true;
-                                }
-                            },
-                            editor.CommandResult.save_and_quit => { 
-                                ed.saveFile(io) catch {}; 
-                                ed.should_quit = true; 
-                            },
-                            editor.CommandResult.force_quit => ed.should_quit = true,
-                            editor.CommandResult.cmd_error => {},
-                            editor.CommandResult.none => {},
-                        }
-                    },
-                    else => |k| {
-                        debugLogMain("  command else: k={}, range check: {}", .{ k, k >= 32 and k < 127 });
-                        if (k >= 32 and k < 127) {
-                            const ch: u8 = @intCast(k & 0xFF);
-                            ed.cmd_buf.append(ed.allocator, ch) catch |err| {
-                                debugLogMain("  APPEND FAILED: {}", .{err});
-                            };
-                            debugLogMain("  appended '{}', cmd_buf.len={}, cmd_buf=\"{s}\"", .{ ch, ed.cmd_buf.items.len, ed.cmd_buf.items });
-                        } else {
-                            debugLogMain("  key out of range, NOT appending", .{});
-                        }
-                    },
-                }
-            },
-        }
-
-        ed.scroll();
-    }
-
-    terminal.Terminal.clearScreen();
-    terminal.Terminal.showCursor();
 }
