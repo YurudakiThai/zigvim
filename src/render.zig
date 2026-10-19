@@ -2,81 +2,98 @@ const std = @import("std");
 const Editor = @import("editor.zig").Editor;
 const Terminal = @import("terminal.zig").Terminal;
 
-pub fn render(editor: *Editor, terminal: *Terminal) void {
-    var ab = std.ArrayList(u8).initCapacity(editor.allocator, 256) catch return;
-    defer ab.deinit(editor.allocator);
+pub fn render(ed: *Editor, term: *Terminal) void {
+    var ab = std.ArrayList(u8).initCapacity(ed.allocator, 4096) catch return;
+    defer ab.deinit(ed.allocator);
 
-    ab.appendSlice(editor.allocator, "\x1b[?25l") catch {}; // Hide cursor
-    ab.appendSlice(editor.allocator, "\x1b[H") catch {}; // Move cursor to top-left
+    ab.appendSlice(ed.allocator, "\x1b[?25l") catch {}; // Hide cursor
+    ab.appendSlice(ed.allocator, "\x1b[H") catch {}; // Move cursor to top-left
 
-    // Draw rows
-    for (0..terminal.screen_rows) |y| {
-        const filerow = y + editor.offset_row;
-        if (filerow >= editor.rows.items.len) {
-            if (filerow == editor.rows.items.len / 2 and editor.rows.items.len == 1) {
-                // Show welcome message
-                const welcome = "zigvim -- type :q to quit";
-                const padding = if (terminal.screen_cols > welcome.len) (terminal.screen_cols - welcome.len) / 2 else 0;
-                ab.appendSlice(editor.allocator, "\x1b[K") catch {};
-                ab.appendSlice(editor.allocator, "\x1b[") catch {};
-                var buf: [16]u8 = undefined;
-                const s = std.fmt.bufPrint(&buf, "{}G", .{padding}) catch unreachable;
-                ab.appendSlice(editor.allocator, s) catch {};
-                ab.appendSlice(editor.allocator, welcome) catch {};
+    // Reserve 2 rows at bottom: 1 for status bar, 1 for message bar
+    const editor_rows = if (term.screen_rows > 2) term.screen_rows - 2 else 1;
+
+    // Draw editor rows
+    var y: usize = 0;
+    while (y < editor_rows) : (y += 1) {
+        const filerow = y + ed.offset_row;
+        if (filerow >= ed.rows.items.len) {
+            if (filerow == ed.rows.items.len / 2 and ed.rows.items.len == 1 and ed.rows.items[0].len == 0) {
+                // Show welcome message centered
+                const welcome = "~ zigvim ~ Press i to insert, :q to quit";
+                const padding = if (term.screen_cols > welcome.len) (term.screen_cols - welcome.len) / 2 else 0;
+                ab.appendSlice(ed.allocator, "\x1b[K") catch {};
+                for (0..padding) |_| {
+                    ab.append(ed.allocator, ' ') catch {};
+                }
+                ab.appendSlice(ed.allocator, welcome) catch {};
             } else {
-                ab.appendSlice(editor.allocator, "\x1b[K") catch {}; // Clear line
+                ab.appendSlice(ed.allocator, "\x1b[K") catch {}; // Clear line
+                ab.appendSlice(ed.allocator, "~") catch {};
             }
         } else {
-            const row = editor.rows.items[filerow];
-            const start = if (editor.offset_col < row.len) editor.offset_col else row.len;
-            const end = if (editor.offset_col + terminal.screen_cols < row.len) editor.offset_col + terminal.screen_cols else row.len;
+            const row = ed.rows.items[filerow];
+            const start = if (ed.offset_col < row.len) ed.offset_col else row.len;
+            const end = if (ed.offset_col + term.screen_cols < row.len) ed.offset_col + term.screen_cols else row.len;
 
-            ab.appendSlice(editor.allocator, "\x1b[K") catch {};
+            ab.appendSlice(ed.allocator, "\x1b[K") catch {};
             if (start < end) {
-                ab.appendSlice(editor.allocator, row[start..end]) catch {};
+                ab.appendSlice(ed.allocator, row[start..end]) catch {};
             }
         }
 
-        if (y < terminal.screen_rows - 1) {
-            ab.appendSlice(editor.allocator, "\r\n") catch {};
-        }
+        ab.appendSlice(ed.allocator, "\r\n") catch {};
     }
 
-    // Draw status bar
-    ab.appendSlice(editor.allocator, "\x1b[K") catch {};
-    ab.appendSlice(editor.allocator, "\x1b[7m") catch {}; // Inverse video
+    // Draw status bar (inverse video)
+    ab.appendSlice(ed.allocator, "\x1b[K") catch {};
+    ab.appendSlice(ed.allocator, "\x1b[7m") catch {};
 
-    const filename = editor.filename orelse "[No Name]";
-    const modified = if (editor.dirty) " [+]" else "";
-    var buf: [256]u8 = undefined;
-    const status = std.fmt.bufPrint(&buf, " {s}{s} - {} lines ", .{ filename, modified, editor.rows.items.len }) catch "???";
-    ab.appendSlice(editor.allocator, status) catch {};
+    const filename = ed.filename orelse "[No Name]";
+    const modified = if (ed.dirty) " [+]" else "";
+    var buf1: [256]u8 = undefined;
+    var buf2: [256]u8 = undefined;
 
-    const rstatus = std.fmt.bufPrint(&buf, " {}/{} ", .{ editor.cursor_row + 1, editor.rows.items.len }) catch "???";
-    const padding = if (terminal.screen_cols > status.len + rstatus.len) terminal.screen_cols - status.len - rstatus.len else 0;
+    // Mode indicator
+    const mode_str = switch (ed.mode) {
+        .normal => " NORMAL ",
+        .insert => " INSERT ",
+        .command => " ",
+    };
+
+    const status = std.fmt.bufPrint(&buf1, "{s} {s}{s} - {} lines", .{ mode_str, filename, modified, ed.rows.items.len }) catch "???";
+    ab.appendSlice(ed.allocator, status) catch {};
+
+    const rstatus = std.fmt.bufPrint(&buf2, "{}:{}", .{ ed.cursor_row + 1, ed.cursor_col + 1 }) catch "???";
+    const padding = if (term.screen_cols > status.len + rstatus.len) term.screen_cols - status.len - rstatus.len else 0;
     for (0..padding) |_| {
-        ab.append(editor.allocator, ' ') catch {};
+        ab.append(ed.allocator, ' ') catch {};
     }
-    ab.appendSlice(editor.allocator, rstatus) catch {};
+    ab.appendSlice(ed.allocator, rstatus) catch {};
 
-    ab.appendSlice(editor.allocator, "\x1b[0m") catch {}; // Reset formatting
-    ab.appendSlice(editor.allocator, "\r\n") catch {};
+    ab.appendSlice(ed.allocator, "\x1b[0m") catch {}; // Reset formatting
+    ab.appendSlice(ed.allocator, "\r\n") catch {};
 
     // Draw message bar
-    ab.appendSlice(editor.allocator, "\x1b[K") catch {};
-    const msg_len = if (editor.status_msg.len < terminal.screen_cols) editor.status_msg.len else terminal.screen_cols;
-    if (msg_len > 0) {
-        ab.appendSlice(editor.allocator, editor.status_msg[0..msg_len]) catch {};
+    ab.appendSlice(ed.allocator, "\x1b[K") catch {};
+    if (ed.mode == .command) {
+        // In command mode, show the command buffer
+        var cmd_buf: [512]u8 = undefined;
+        const cmd_str = std.fmt.bufPrint(&cmd_buf, ":{s}", .{ed.cmd_buf.items}) catch ":";
+        ab.appendSlice(ed.allocator, cmd_str) catch {};
+    } else if (ed.status_msg.len > 0) {
+        const msg_len = if (ed.status_msg.len < term.screen_cols) ed.status_msg.len else term.screen_cols;
+        ab.appendSlice(ed.allocator, ed.status_msg[0..msg_len]) catch {};
     }
 
     // Position cursor
-    ab.appendSlice(editor.allocator, "\x1b[") catch {};
-    const cursor_screen_row = editor.cursor_row - editor.offset_row + 1;
-    const cursor_screen_col = editor.cursor_col - editor.offset_col + 1;
-    const pos = std.fmt.bufPrint(&buf, "{};{}H", .{ cursor_screen_row, cursor_screen_col }) catch unreachable;
-    ab.appendSlice(editor.allocator, pos) catch {};
+    ab.appendSlice(ed.allocator, "\x1b[") catch {};
+    const cursor_screen_row = ed.cursor_row - ed.offset_row + 1;
+    const cursor_screen_col = ed.cursor_col - ed.offset_col + 1;
+    var pos_buf: [64]u8 = undefined;
+    const pos = std.fmt.bufPrint(&pos_buf, "{};{}H", .{ cursor_screen_row, cursor_screen_col }) catch unreachable;
+    ab.appendSlice(ed.allocator, pos) catch {};
 
-    ab.appendSlice(editor.allocator, "\x1b[?25h") catch {}; // Show cursor
+    ab.appendSlice(ed.allocator, "\x1b[?25h") catch {}; // Show cursor
 
     Terminal.write(ab.items);
 }

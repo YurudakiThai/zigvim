@@ -1,34 +1,39 @@
 # Build outputs
-zig-cache/
 zig-out/
+zig-cache/
 .zig-cache/
+zigvim
+*.exe
+*.dll
+*.so
+*.dylib
 
 # OS files
 .DS_Store
 Thumbs.db
 
 # Editor files
+.idea/
+.vscode/
 *.swp
 *.swo
 *~
-.vscode/
-.idea/
 
-# Temporary files
-*.tmp
-*.bak
+# Test artifacts
+test_*.txt
 *.log
+nvim.log
 
-# Coverage
-coverage/
-htmlcov/
-.coverage
-
-# Python
+# Python (oracle scripts)
 __pycache__/
 *.pyc
-*.pyo
 .pytest_cache/
 
-# Session history
-session/history.csv
+# Debug logs
+/tmp/zigvim-debug.log
+
+# Session archive (old sessions preserved for reference)
+session/archive/
+
+# Note: Neovim runtime (runtime/lua/) is fetched via scripts/fetch-runtime.sh
+# and should NOT be committed (3.3MB of Neovim's code)
