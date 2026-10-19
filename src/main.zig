@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c");
+const uv = @import("platform/uv.zig");
 
 // Debug logging to file using C stdio
 var debug_log_file_main: ?*c.FILE = null;
@@ -37,7 +38,9 @@ pub fn main(init: std.process.Init) !void {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--version")) {
+            const ver = uv.getVersion();
             std.debug.print("zigvim v0.1.0\n", .{});
+            std.debug.print("libuv v{d}.{d}.{d}\n", .{ ver.major, ver.minor, ver.patch });
             return;
         } else if (std.mem.eql(u8, arg, "--headless")) {
             // no-op
@@ -93,7 +96,6 @@ fn runRpcServer(gpa: std.mem.Allocator, io: std.Io) !void {
     _ = gpa;
     _ = io;
     // TODO: Implement msgpack-RPC server
-    // For now, just print a message and exit
     std.debug.print("zigvim RPC server starting...\n", .{});
     std.debug.print("Listening on stdin/stdout for msgpack-RPC messages\n", .{});
     std.debug.print("TODO: Implement proper msgpack-RPC protocol\n", .{});
@@ -144,6 +146,25 @@ fn runLuaScript(script_path: [:0]const u8, gpa: std.mem.Allocator, io: std.Io, a
         }
         return error.LuaError;
     }
+
+    // TASK-INFRA-002: Pump the event loop to execute scheduled/deferred callbacks
+    // Run until there are no more active handles
+    pumpEventLoop();
+}
+
+/// Pump the libuv event loop to execute any pending timers and async callbacks.
+/// This is called after Lua script execution to process vim.schedule/vim.defer_fn.
+fn pumpEventLoop() void {
+    const loop = c.uv_default_loop();
+
+    // Keep running while there are active handles
+    while (c.uv_loop_alive(loop) != 0) {
+        // Run one iteration of the event loop
+        _ = c.uv_run(loop, c.UV_RUN_ONCE);
+    }
+
+    // Final cleanup run to process any remaining callbacks
+    _ = c.uv_run(loop, c.UV_RUN_NOWAIT);
 }
 
 fn setupVimApi(L: *c.lua_State) !void {
@@ -287,12 +308,447 @@ fn setupVimVariables(L: *c.lua_State) !void {
     }
 }
 
+// ============================================================================
+// TASK-INFRA-002: libuv-based event loop
+// ============================================================================
+
+/// Timer data stored in malloc'd memory (survives across callbacks)
+const TimerData = struct {
+    timer: c.uv_timer_t,
+    L: *c.lua_State,
+    callback_ref: c_int,
+    auto_close: bool,
+};
+
+/// Timer callback - called when timer fires
+fn uvTimerCallback(handle: ?*c.uv_timer_t) callconv(.c) void {
+    const h = handle orelse return;
+    const data: *TimerData = @ptrCast(@alignCast(h.*.data));
+    const L = data.L;
+
+    // Get the callback from registry
+    _ = c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, data.callback_ref);
+    if (c.lua_pcall(L, 0, 0, 0) != 0) {
+        const err = luaToString(L, -1);
+        if (err) |e| {
+            std.debug.print("Timer callback error: {s}\n", .{e});
+        }
+        _ = c.lua_pop(L, 1);
+    }
+
+    // Auto-close for one-shot timers (schedule, defer_fn)
+    if (data.auto_close) {
+        c.uv_close(@ptrCast(&data.timer), @ptrCast(&uvTimerAutoCloseCb));
+    }
+}
+
+/// Close callback for auto-closing timers
+fn uvTimerAutoCloseCb(handle: ?*c.uv_handle_t) callconv(.c) void {
+    const h = handle orelse return;
+    const data: *TimerData = @ptrCast(@alignCast(h.*.data));
+    const L = data.L;
+
+    // Unreference the callback
+    if (data.callback_ref != c.LUA_NOREF) {
+        c.luaL_unref(L, c.LUA_REGISTRYINDEX, data.callback_ref);
+    }
+
+    // Free the data
+    c.free(data);
+}
+
+/// Close callback for manual close (timer:close())
+fn uvTimerManualCloseCb(handle: ?*c.uv_handle_t) callconv(.c) void {
+    const h = handle orelse return;
+    const data: *TimerData = @ptrCast(@alignCast(h.*.data));
+    const L = data.L;
+
+    if (data.callback_ref != c.LUA_NOREF) {
+        c.luaL_unref(L, c.LUA_REGISTRYINDEX, data.callback_ref);
+    }
+
+    c.free(data);
+}
+
+/// vim.uv.new_timer() - create a new libuv timer
+fn luaNewTimer(L: ?*c.lua_State) callconv(.c) c_int {
+    const state = L orelse return 0;
+
+    // Allocate timer data
+    const data: *TimerData = @ptrCast(@alignCast(c.malloc(@sizeOf(TimerData))));
+    data.* = .{
+        .timer = undefined,
+        .L = state,
+        .callback_ref = c.LUA_NOREF,
+        .auto_close = false,
+    };
+
+    // Initialize the timer on default loop
+    const result = c.uv_timer_init(c.uv_default_loop(), &data.timer);
+    if (result != 0) {
+        c.free(data);
+        return c.luaL_error(state, "Failed to create timer");
+    }
+    data.timer.data = data;
+
+    // Create a table to represent the timer object
+    c.lua_newtable(state);
+
+    // Store the data pointer as light userdata
+    c.lua_pushlightuserdata(state, data);
+    c.lua_setfield(state, -2, "_handle");
+
+    // Add methods
+    _ = c.lua_pushstring(state, "start");
+    _ = c.lua_pushcfunction(state, @as(c.lua_CFunction, @ptrCast(&luaTimerStart)));
+    c.lua_settable(state, -3);
+
+    _ = c.lua_pushstring(state, "stop");
+    _ = c.lua_pushcfunction(state, @as(c.lua_CFunction, @ptrCast(&luaTimerStop)));
+    c.lua_settable(state, -3);
+
+    _ = c.lua_pushstring(state, "close");
+    _ = c.lua_pushcfunction(state, @as(c.lua_CFunction, @ptrCast(&luaTimerClose)));
+    c.lua_settable(state, -3);
+
+    _ = c.lua_pushstring(state, "is_active");
+    _ = c.lua_pushcfunction(state, @as(c.lua_CFunction, @ptrCast(&luaTimerIsActive)));
+    c.lua_settable(state, -3);
+
+    return 1;
+}
+
+/// timer:start(timeout, repeat, callback)
+fn luaTimerStart(L: ?*c.lua_State) callconv(.c) c_int {
+    const state = L orelse return 0;
+
+    // Get handle from self
+    _ = c.lua_getfield(state, 1, "_handle");
+    const data: *TimerData = @ptrCast(@alignCast(c.lua_touserdata(state, -1)));
+    _ = c.lua_pop(state, 1);
+
+    const timeout: u64 = @intFromFloat(c.lua_tonumber(state, 2));
+    const repeat_interval: u64 = @intFromFloat(c.lua_tonumber(state, 3));
+
+    // Unreference old callback if any
+    if (data.callback_ref != c.LUA_NOREF) {
+        c.luaL_unref(state, c.LUA_REGISTRYINDEX, data.callback_ref);
+    }
+
+    // Store callback in registry
+    c.lua_pushvalue(state, 4);
+    data.callback_ref = c.luaL_ref(state, c.LUA_REGISTRYINDEX);
+    data.auto_close = false; // manual timer, user controls lifecycle
+
+    const result = c.uv_timer_start(&data.timer, @ptrCast(&uvTimerCallback), timeout, repeat_interval);
+    if (result != 0) {
+        return c.luaL_error(state, "Failed to start timer");
+    }
+
+    return 0;
+}
+
+/// timer:stop()
+fn luaTimerStop(L: ?*c.lua_State) callconv(.c) c_int {
+    const state = L orelse return 0;
+
+    _ = c.lua_getfield(state, 1, "_handle");
+    const data: *TimerData = @ptrCast(@alignCast(c.lua_touserdata(state, -1)));
+    _ = c.lua_pop(state, 1);
+
+    _ = c.uv_timer_stop(&data.timer);
+
+    return 0;
+}
+
+/// timer:close(callback?)
+fn luaTimerClose(L: ?*c.lua_State) callconv(.c) c_int {
+    const state = L orelse return 0;
+
+    _ = c.lua_getfield(state, 1, "_handle");
+    const data: *TimerData = @ptrCast(@alignCast(c.lua_touserdata(state, -1)));
+    _ = c.lua_pop(state, 1);
+
+    // If callback provided, call it after close
+    // For simplicity, we ignore the callback and just close
+    c.uv_close(@ptrCast(&data.timer), @ptrCast(&uvTimerManualCloseCb));
+
+    return 0;
+}
+
+/// timer:is_active()
+fn luaTimerIsActive(L: ?*c.lua_State) callconv(.c) c_int {
+    const state = L orelse return 0;
+
+    _ = c.lua_getfield(state, 1, "_handle");
+    const data: *TimerData = @ptrCast(@alignCast(c.lua_touserdata(state, -1)));
+    _ = c.lua_pop(state, 1);
+
+    const active = c.uv_is_active(@ptrCast(&data.timer));
+    c.lua_pushboolean(state, active);
+    return 1;
+}
+
+fn setupVimUv(L: *c.lua_State) !void {
+    // Create vim.uv table
+    _ = c.lua_getglobal(L, "vim");
+    if (c.lua_isnil(L, -1)) {
+        c.lua_pop(L, 1);
+        c.lua_newtable(L);
+        c.lua_setglobal(L, "vim");
+        _ = c.lua_getglobal(L, "vim");
+    }
+
+    _ = c.lua_getfield(L, -1, "uv");
+    if (c.lua_isnil(L, -1)) {
+        c.lua_pop(L, 1);
+        c.lua_newtable(L);
+        c.lua_setfield(L, -2, "uv");
+        _ = c.lua_getfield(L, -1, "uv");
+    }
+
+    // vim.uv.new_timer = luaNewTimer
+    _ = c.lua_pushstring(L, "new_timer");
+    _ = c.lua_pushcfunction(L, @as(c.lua_CFunction, @ptrCast(&luaNewTimer)));
+    c.lua_settable(L, -3);
+
+    c.lua_pop(L, 2); // pop vim.uv and vim
+
+    // Rest of vim.uv functions via Lua string
+    const uv_mock_lua =
+        \\vim = vim or {}
+        \\vim.uv = vim.uv or {}
+        \\vim.uv.os_uname = function()
+        \\  local h = io.popen("uname -s -r -v -m 2>/dev/null")
+        \\  if h then
+        \\    local line = h:read("*l")
+        \\    h:close()
+        \\    if line then
+        \\      local parts = {}
+        \\      for part in string.gmatch(line, "[^ ]+") do table.insert(parts, part) end
+        \\      if #parts >= 4 then
+        \\        local version_parts = {}
+        \\        for i = 3, #parts - 1 do table.insert(version_parts, parts[i]) end
+        \\        return {
+        \\          sysname = parts[1],
+        \\          release = parts[2],
+        \\          version = table.concat(version_parts, " "),
+        \\          machine = parts[#parts]
+        \\        }
+        \\      end
+        \\    end
+        \\  end
+        \\  return { sysname = "Unknown" }
+        \\end
+        \\vim.uv.cwd = function() return os.getenv("PWD") or "." end
+        \\vim.uv.os_homedir = function() return os.getenv("HOME") or "/tmp" end
+        \\vim.uv.os_getenv = function(name) return os.getenv(name) end
+        \\vim.uv.fs_stat = function(path) local f = io.open(path, "r"); if f then f:close(); return { type = "file" } end; local h = io.popen("test -d '" .. path .. "' && echo dir"); local is_dir = h:read("*l"); h:close(); if is_dir == "dir" then return { type = "directory" } end; return nil end
+        \\vim.uv.fs_lstat = function(path) return vim.uv.fs_stat(path) end
+        \\vim.uv.fs_realpath = function(path) local h = io.popen("realpath '" .. path .. "' 2>/dev/null"); local r = h:read("*l"); h:close(); return r or path end
+        \\vim.uv.hrtime = function() return os.clock() * 1e9 end
+    ;
+
+    if (c.luaL_dostring(L, uv_mock_lua)) {
+        const err = luaToString(L, -1);
+        if (err) |e| {
+            std.debug.print("Failed to setup vim.uv: {s}\n", .{e});
+        }
+        return error.LuaSetupFailed;
+    }
+}
+
+/// WaitData - data structure for vim.wait
+const WaitData = struct {
+    L: *c.lua_State,
+    condition_ref: c_int,
+    interval_timer: c.uv_timer_t,
+    timeout_timer: c.uv_timer_t,
+    done: bool,
+    success: bool,
+    interval: u64,
+};
+
+/// Interval timer callback - check condition
+fn vimWaitIntervalCallback(handle: ?*c.uv_timer_t) callconv(.c) void {
+    const h = handle orelse return;
+    const data: *WaitData = @ptrCast(@alignCast(h.*.data));
+    const L = data.L;
+
+    // Call the condition function
+    _ = c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, data.condition_ref);
+    if (c.lua_pcall(L, 0, 1, 0) != 0) {
+        // Error in condition, treat as false
+        _ = c.lua_pop(L, 1);
+        return;
+    }
+
+    // Check if result is truthy
+    const result = c.lua_toboolean(L, -1);
+    _ = c.lua_pop(L, 1);
+
+    if (result != 0) {
+        data.success = true;
+        data.done = true;
+        // Stop both timers
+        _ = c.uv_timer_stop(&data.interval_timer);
+        _ = c.uv_timer_stop(&data.timeout_timer);
+    }
+}
+
+/// Timeout timer callback - set done flag
+fn vimWaitTimeoutCallback(handle: ?*c.uv_timer_t) callconv(.c) void {
+    const h = handle orelse return;
+    const data: *WaitData = @ptrCast(@alignCast(h.*.data));
+    data.done = true;
+    data.success = false;
+    // Stop interval timer
+    _ = c.uv_timer_stop(&data.interval_timer);
+}
+
+/// vim.wait(timeout, condition, interval, fast_break)
+/// C implementation that pumps the event loop
+fn luaVimWait(L: ?*c.lua_State) callconv(.c) c_int {
+    const state = L orelse return 0;
+
+    const timeout: u64 = @intFromFloat(c.lua_tonumber(state, 1));
+    const has_condition = !c.lua_isnil(state, 2);
+    const interval: u64 = if (c.lua_isnil(state, 3)) 200 else @intFromFloat(c.lua_tonumber(state, 3));
+
+    // If no condition, just sleep
+    if (!has_condition) {
+        // Create a one-shot timer
+        var wait_data: WaitData = .{
+            .L = state,
+            .condition_ref = c.LUA_NOREF,
+            .interval_timer = undefined,
+            .timeout_timer = undefined,
+            .done = false,
+            .success = true,
+            .interval = 0,
+        };
+
+        _ = c.uv_timer_init(c.uv_default_loop(), &wait_data.timeout_timer);
+        wait_data.timeout_timer.data = &wait_data;
+        _ = c.uv_timer_start(&wait_data.timeout_timer, @ptrCast(&vimWaitTimeoutCallback), timeout, 0);
+
+        // Pump event loop until done
+        while (!wait_data.done) {
+            _ = c.uv_run(c.uv_default_loop(), c.UV_RUN_ONCE);
+        }
+
+        // Cleanup
+        c.uv_close(@ptrCast(&wait_data.timeout_timer), null);
+        _ = c.uv_run(c.uv_default_loop(), c.UV_RUN_NOWAIT);
+
+        c.lua_pushboolean(state, 1); // true
+        c.lua_pushnil(state); // nil (no timeout)
+        return 2;
+    }
+
+    // Check condition immediately
+    c.lua_pushvalue(state, 2); // push condition function
+    if (c.lua_pcall(state, 0, 1, 0) != 0) {
+        // Error in condition, pop error and continue
+        _ = c.lua_pop(state, 1);
+    } else {
+        const result = c.lua_toboolean(state, -1);
+        _ = c.lua_pop(state, 1);
+        if (result != 0) {
+            c.lua_pushboolean(state, 1); // true
+            c.lua_pushnil(state); // nil
+            return 2;
+        }
+    }
+
+    // Store condition in registry
+    c.lua_pushvalue(state, 2);
+    const condition_ref = c.luaL_ref(state, c.LUA_REGISTRYINDEX);
+
+    // Create wait data on stack (will be valid for the duration of this function)
+    var wait_data: WaitData = .{
+        .L = state,
+        .condition_ref = condition_ref,
+        .interval_timer = undefined,
+        .timeout_timer = undefined,
+        .done = false,
+        .success = false,
+        .interval = interval,
+    };
+
+    // Initialize interval timer
+    _ = c.uv_timer_init(c.uv_default_loop(), &wait_data.interval_timer);
+    wait_data.interval_timer.data = &wait_data;
+    _ = c.uv_timer_start(&wait_data.interval_timer, @ptrCast(&vimWaitIntervalCallback), interval, interval);
+
+    // Initialize timeout timer
+    _ = c.uv_timer_init(c.uv_default_loop(), &wait_data.timeout_timer);
+    wait_data.timeout_timer.data = &wait_data;
+    _ = c.uv_timer_start(&wait_data.timeout_timer, @ptrCast(&vimWaitTimeoutCallback), timeout, 0);
+
+    // Pump event loop until done
+    while (!wait_data.done) {
+        _ = c.uv_run(c.uv_default_loop(), c.UV_RUN_ONCE);
+    }
+
+    // Cleanup timers
+    c.uv_close(@ptrCast(&wait_data.interval_timer), null);
+    c.uv_close(@ptrCast(&wait_data.timeout_timer), null);
+    _ = c.uv_run(c.uv_default_loop(), c.UV_RUN_NOWAIT);
+
+    // Unreference condition
+    c.luaL_unref(state, c.LUA_REGISTRYINDEX, condition_ref);
+
+    // Return result
+    if (wait_data.success) {
+        c.lua_pushboolean(state, 1); // true
+        c.lua_pushnil(state); // nil
+    } else {
+        c.lua_pushboolean(state, 0); // false
+        // Neovim returns -1 for timeout, not "timeout" string
+        c.lua_pushinteger(state, -1);
+    }
+    return 2;
+}
+
+/// Setup vim.schedule, vim.defer_fn, vim.wait using libuv timers
 fn setupVimEventLoop(L: *c.lua_State) !void {
     const eventloop_lua =
         \\vim = vim or {}
-        \\vim.schedule = function(fn) table.insert({}, fn); fn() end
-        \\vim.defer_fn = function(fn, timeout) fn() end
-        \\vim.wait = function(timeout, condition, interval) if not condition then return true end; if condition() then return true end; return false end
+        \\
+        \\-- Internal queue for scheduled callbacks (FIFO)
+        \\local _scheduled_queue = {}
+        \\local _scheduled_head = 1
+        \\local _scheduled_tail = 0
+        \\
+        \\-- vim.schedule(fn) - queue callback for next event loop iteration
+        \\-- Implemented as a 0ms timer that auto-closes after firing
+        \\-- NOTE: Neovim does NOT return a handle from vim.schedule
+        \\vim.schedule = function(fn)
+        \\  if type(fn) ~= "function" then
+        \\    error("vim.schedule: expected function, got " .. type(fn))
+        \\  end
+        \\  -- Use a 0ms timer to defer execution to next tick
+        \\  local timer = vim.uv.new_timer()
+        \\  timer:start(0, 0, function()
+        \\    fn()
+        \\  end)
+        \\  -- Neovim does not return the timer handle
+        \\end
+        \\
+        \\-- vim.defer_fn(fn, timeout) - schedule callback after delay
+        \\vim.defer_fn = function(fn, timeout)
+        \\  if type(fn) ~= "function" then
+        \\    error("vim.defer_fn: expected function, got " .. type(fn))
+        \\  end
+        \\  local timer = vim.uv.new_timer()
+        \\  timer:start(timeout or 0, 0, function()
+        \\    fn()
+        \\  end)
+        \\  return timer
+        \\end
+        \\
+        \\-- vim.wait is implemented in C (luaVimWait) and registered below
     ;
 
     if (c.luaL_dostring(L, eventloop_lua)) {
@@ -302,6 +758,13 @@ fn setupVimEventLoop(L: *c.lua_State) !void {
         }
         return error.LuaSetupFailed;
     }
+
+    // Register vim.wait as C function
+    _ = c.lua_getglobal(L, "vim");
+    _ = c.lua_pushstring(L, "wait");
+    _ = c.lua_pushcfunction(L, @as(c.lua_CFunction, @ptrCast(&luaVimWait)));
+    c.lua_settable(L, -3);
+    _ = c.lua_pop(L, 1); // pop vim
 }
 
 fn setupVimJson(L: *c.lua_State) !void {
@@ -413,7 +876,9 @@ fn setupVimVersion(L: *c.lua_State) !void {
     ;
     if (c.luaL_dostring(L, version_lua)) {
         const err = luaToString(L, -1);
-        if (err) |e| { std.debug.print("Failed to setup vim.version: {s}\n", .{e}); }
+        if (err) |e| {
+            std.debug.print("Failed to setup vim.version: {s}\n", .{e});
+        }
         return error.LuaSetupFailed;
     }
 }
@@ -429,7 +894,9 @@ fn setupVimFn(L: *c.lua_State) !void {
     ;
     if (c.luaL_dostring(L, fn_lua)) {
         const err = luaToString(L, -1);
-        if (err) |e| { std.debug.print("Failed to setup vim.fn: {s}\n", .{e}); }
+        if (err) |e| {
+            std.debug.print("Failed to setup vim.fn: {s}\n", .{e});
+        }
         return error.LuaSetupFailed;
     }
 }
@@ -442,33 +909,8 @@ fn setupVimInspect(L: *c.lua_State) !void {
     ;
     if (c.luaL_dostring(L, inspect_lua)) {
         const err = luaToString(L, -1);
-        if (err) |e| { std.debug.print("Failed to setup vim.inspect: {s}\n", .{e}); }
-        return error.LuaSetupFailed;
-    }
-}
-
-fn setupVimUv(L: *c.lua_State) !void {
-    const uv_mock_lua =
-        \\vim = vim or {}
-        \\vim.uv = {
-        \\  os_uname = function() return { sysname = "Darwin" } end,
-        \\  cwd = function() return os.getenv("PWD") or "." end,
-        \\  os_homedir = function() return os.getenv("HOME") or "/tmp" end,
-        \\  os_getenv = function(name) return os.getenv(name) end,
-        \\  fs_stat = function(path) local f = io.open(path, "r"); if f then f:close(); return { type = "file" } end; local h = io.popen("test -d '" .. path .. "' && echo dir"); local is_dir = h:read("*l"); h:close(); if is_dir == "dir" then return { type = "directory" } end; return nil end,
-        \\  fs_lstat = function(path) return vim.uv.fs_stat(path) end,
-        \\  fs_realpath = function(path) local h = io.popen("realpath '" .. path .. "' 2>/dev/null"); local r = h:read("*l"); h:close(); return r or path end,
-        \\  fs_scandir = function(path) local h = io.popen("ls -1 '" .. path .. "' 2>/dev/null"); local files = {}; for line in h:lines() do table.insert(files, line) end; h:close(); local i = 0; return function() i = i + 1; if i <= #files then return files[i], "file" end end end,
-        \\  fs_scandir_next = function(req) return req() end,
-        \\  fs_rmdir = function(path) os.execute("rmdir '" .. path .. "'"); return true end,
-        \\  fs_unlink = function(path) os.execute("rm '" .. path .. "'"); return true end,
-        \\}
-    ;
-
-    if (c.luaL_dostring(L, uv_mock_lua)) {
-        const err = luaToString(L, -1);
         if (err) |e| {
-            std.debug.print("Failed to setup vim.uv: {s}\n", .{e});
+            std.debug.print("Failed to setup vim.inspect: {s}\n", .{e});
         }
         return error.LuaSetupFailed;
     }
@@ -480,7 +922,9 @@ fn setupPackagePath(L: *c.lua_State) !void {
     ;
     if (c.luaL_dostring(L, setup_path_lua)) {
         const err = luaToString(L, -1);
-        if (err) |e| { std.debug.print("Failed to setup package.path: {s}\n", .{e}); }
+        if (err) |e| {
+            std.debug.print("Failed to setup package.path: {s}\n", .{e});
+        }
         return error.LuaSetupFailed;
     }
 }
