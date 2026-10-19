@@ -44,9 +44,12 @@ See `docs/vibe-coding-playbook.md` for the complete vibe coding workflow.
 
 | Phase | Tasks | Status |
 |-------|-------|--------|
-| Bootstrap | TASK-001 to TASK-005 | 🟡 In progress |
-| Editor Core | TASK-006 to TASK-008 | ⬜ Not started |
-| Options & Autocmds | TASK-009 to TASK-012 | ⬜ Not started |
+| Bootstrap | TASK-001 to TASK-005 | ✅ Complete |
+| Editor Core | TASK-006 to TASK-008 | ✅ Complete |
+| Options & Autocmds | TASK-009 to TASK-012 | ✅ Complete |
+| Infrastructure | TASK-INFRA-001 to TASK-INFRA-005 | ✅ Complete |
+
+Run `./scripts/progress.sh` for the live pass/fail report.
 
 ## 📜 License
 

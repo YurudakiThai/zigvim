@@ -20,9 +20,23 @@ if [[ "$TASK" == "all" ]]; then
       ((fail++)); echo "  FAIL $name"
     fi
   done
+  # TASK-INFRA-005 drives the RPC server over stdin/stdout, so it uses the
+  # dedicated integration harness instead of a Lua oracle case.
+  if python3 "$DIR/rpc_verify.py" --zigvim "$ZIGVIM" >/dev/null 2>&1; then
+    ((pass++)); echo "  PASS TASK-INFRA-005"
+  else
+    ((fail++)); echo "  FAIL TASK-INFRA-005"
+  fi
   echo ""; echo "=== $pass pass / $fail fail ==="
   [[ "$fail" -eq 0 ]]
   exit
+fi
+
+# TASK-INFRA-005 has no Lua case; it is verified end-to-end over the
+# msgpack-RPC transport.
+if [[ "$TASK" == "TASK-INFRA-005" ]]; then
+  ZIGVIM="${ZIGVIM:-$ROOT/zig-out/bin/zigvim}"
+  exec python3 "$DIR/rpc_verify.py" --zigvim "$ZIGVIM"
 fi
 
 # Single task

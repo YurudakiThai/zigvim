@@ -37,13 +37,14 @@ def run_nvim_lua(lua_code: str, nvim_bin: str = NVIM) -> dict:
             text=True,
             timeout=TIMEOUT,
         )
-        stdout = result.stdout.strip()
-        if not stdout:
-            return {"_error": "no output", "stderr": result.stderr}
+        # Neovim outputs to stderr when using -l flag
+        output = result.stderr.strip() if result.stderr.strip() else result.stdout.strip()
+        if not output:
+            return {"_error": "no output", "stderr": result.stderr, "stdout": result.stdout}
         try:
-            return json.loads(stdout)
+            return json.loads(output)
         except json.JSONDecodeError as e:
-            return {"_error": f"invalid json: {e}", "stdout": stdout, "stderr": result.stderr}
+            return {"_error": f"invalid json: {e}", "stdout": result.stdout, "stderr": result.stderr}
     except subprocess.TimeoutExpired:
         return {"_error": "timeout"}
     except Exception as e:
@@ -52,8 +53,36 @@ def run_nvim_lua(lua_code: str, nvim_bin: str = NVIM) -> dict:
         os.unlink(lua_path)
 
 
+def normalize_json_strings(obj):
+    """Recursively parse and normalize JSON strings within objects.
+    
+    This handles the case where a field contains a JSON string (like vim.json.encode output).
+    We parse it, then re-serialize with sorted keys so comparison is order-independent.
+    """
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if isinstance(value, str):
+                try:
+                    # Try to parse as JSON
+                    parsed = json.loads(value)
+                    # Re-serialize with sorted keys for deterministic comparison
+                    obj[key] = json.dumps(parsed, sort_keys=True, separators=(',', ':'))
+                except (json.JSONDecodeError, ValueError):
+                    pass  # Not a JSON string, keep as-is
+            else:
+                normalize_json_strings(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            normalize_json_strings(item)
+
+
 def deep_equal(a, b) -> bool:
-    """Deep equality check for JSON-serializable objects."""
+    """Deep equality check for JSON-serializable objects.
+    
+    Normalizes JSON strings to handle non-deterministic key ordering in Lua tables.
+    """
+    normalize_json_strings(a)
+    normalize_json_strings(b)
     return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
 
 

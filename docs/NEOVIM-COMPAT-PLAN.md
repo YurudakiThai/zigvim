@@ -2,7 +2,7 @@
 
 **Version:** 2.0  
 **Date:** 2026-10-19  
-**Status:** Planning Phase  
+**Status:** Phase 0 complete  
 **Goal:** Build a Neovim-compatible editor in Zig that works on Windows, macOS, and Linux
 
 ---
