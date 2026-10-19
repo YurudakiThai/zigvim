@@ -1,0 +1,99 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            zig-version: '0.17.0'
+          - os: macos-latest
+            zig-version: '0.17.0'
+          - os: windows-latest
+            zig-version: '0.17.0'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ matrix.zig-version }}
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libluajit-5.1-dev libuv1-dev neovim
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install luajit libuv neovim
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # Install via chocolatey or scoop
+          choco install zig luajit libuv neovim -y
+
+      - name: Fetch Neovim runtime
+        run: |
+          chmod +x scripts/fetch-runtime.sh
+          ./scripts/fetch-runtime.sh
+
+      - name: Build
+        run: zig build
+
+      - name: Run tests
+        run: |
+          chmod +x scripts/verify.sh
+          ./scripts/verify.sh all
+
+      - name: Check progress
+        run: |
+          chmod +x scripts/progress.sh
+          ./scripts/progress.sh
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zigvim-${{ matrix.os }}
+          path: zig-out/bin/zigvim*
+
+  test-cross-compile:
+    name: Cross-compile ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - x86_64-macos
+          - aarch64-macos
+          - x86_64-windows-gnu
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: '0.17.0'
+
+      - name: Cross-compile
+        run: |
+          zig build -Dtarget=${{ matrix.target }}
+          ls -lh zig-out/bin/

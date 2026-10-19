@@ -35,5 +35,6 @@ __pycache__/
 # Session archive (old sessions preserved for reference)
 session/archive/
 
-# Note: Neovim runtime (runtime/lua/) is fetched via scripts/fetch-runtime.sh
-# and should NOT be committed (3.3MB of Neovim's code)
+# Neovim runtime (fetched via scripts/fetch-runtime.sh)
+# This is 3.3MB of Neovim's code - should not be committed
+runtime/lua/
