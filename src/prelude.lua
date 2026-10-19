@@ -657,12 +657,21 @@ local function write_file(path, lines)
   f:close()
 end
 
+local function fire_autocmd(event, opts)
+  if vim._exec_autocmds then
+    vim._exec_autocmds(event, opts)
+  end
+end
+
 local function edit_path(path)
   local full = vim.fn.fnamemodify(path, ':p')
   local lines = read_file(full)
   vim.api.nvim_buf_set_name(0, path)
   vim.api.nvim_buf_set_lines(0, 0, -1, false, lines or { '' })
   vim._buf_set_modified(0, false)
+  fire_autocmd('BufReadPost', {buffer = 0})
+  fire_autocmd('BufEnter', {buffer = 0})
+  fire_autocmd('BufWinEnter', {buffer = 0})
 end
 
 local function write_current(path)
@@ -676,8 +685,10 @@ local function write_current(path)
   if target == '' then
     error('E32: No file name')
   end
+  fire_autocmd('BufWritePre', {buffer = 0})
   write_file(target, buffer_lines())
   vim._buf_set_modified(0, false)
+  fire_autocmd('BufWritePost', {buffer = 0})
 end
 
 local function parse_set(arg)
@@ -732,13 +743,22 @@ local function exec_cmd(cmd)
     vim.api.nvim_set_current_buf(buf)
   elseif name == 'set' then
     for option in rest:gmatch('%S+') do
+      local key, value = option:match('^([^=]+)=(.*)$')
       parse_set(option)
+      if key == 'filetype' or key == 'ft' then
+        vim.bo.filetype = value
+        fire_autocmd('FileType', {pattern = value})
+      end
     end
   elseif name == 'setlocal' then
     for option in rest:gmatch('%S+') do
       local key, value = option:match('^([^=]+)=(.*)$')
       if key then
         vim.bo[key] = tonumber(value) or value
+        if key == 'filetype' or key == 'ft' then
+          vim.bo.filetype = value
+          fire_autocmd('FileType', {pattern = value})
+        end
       else
         vim.bo[option] = true
       end
@@ -1363,6 +1383,353 @@ do
     local raw = vim.api[name]
     vim.api[name] = function(tab, ...)
       return raw(check_tab(tab), ...)
+    end
+  end
+end
+
+-- ---------------------------------------------------------------- autocmds
+do
+  local known_events = {}
+  for _, event in ipairs({
+    'BufAdd', 'BufDelete', 'BufEnter', 'BufFilePost', 'BufFilePre', 'BufHidden',
+    'BufLeave', 'BufNew', 'BufNewFile', 'BufReadCmd', 'BufReadPost',
+    'BufReadPre', 'BufUnload', 'BufWinEnter', 'BufWinLeave', 'BufWipeout',
+    'BufWriteCmd', 'BufWritePost', 'BufWritePre', 'ChanInfo', 'ChanOpen',
+    'CmdUndefined', 'CmdlineChanged', 'CmdlineEnter', 'CmdlineLeave',
+    'CmdwinEnter', 'CmdwinLeave', 'ColorScheme', 'ColorSchemePre',
+    'CompleteChanged', 'CompleteDone', 'CompleteDonePre', 'CursorHold',
+    'CursorHoldI', 'CursorMoved', 'CursorMovedI', 'DiagnosticChanged',
+    'DiffUpdated', 'DirChanged', 'DirChangedPre', 'EncodingChanged',
+    'ExitPre', 'FileAppendPost', 'FileAppendPre', 'FileChangedRO',
+    'FileChangedShell', 'FileChangedShellPost', 'FileEncoding',
+    'FileReadCmd', 'FileReadPost', 'FileReadPre', 'FileType', 'FileWriteCmd',
+    'FileWritePost', 'FileWritePre', 'FilterReadPost', 'FilterReadPre',
+    'FilterWritePost', 'FilterWritePre', 'FocusGained', 'FocusLost',
+    'FuncUndefined', 'GUIEnter', 'GUIFailed', 'InsertChange', 'InsertCharPre',
+    'InsertEnter', 'InsertLeave', 'InsertLeavePre', 'LspAttach', 'LspDetach',
+    'LspNotify', 'LspProgress', 'LspRequest', 'MenuPopup', 'ModeChanged',
+    'OptionSet', 'QuickFixCmdPost', 'QuickFixCmdPre', 'QuitPre',
+    'RecordingEnter', 'RecordingLeave', 'RemoteReply', 'SafeState',
+    'SafeStateAgain', 'SearchWrapped', 'SessionLoadPost', 'ShellCmdPost',
+    'ShellFilterPost', 'SourceCmd', 'SourcePost', 'SourcePre',
+    'SpellFileMissing', 'StdinReadPost', 'StdinReadPre', 'SwapExists',
+    'Syntax', 'TabClosed', 'TabEnter', 'TabLeave', 'TabNew', 'TabNewEntered',
+    'TermClose', 'TermEnter', 'TermLeave', 'TermOpen', 'TermRequest',
+    'TermResponse', 'TextChanged', 'TextChangedI', 'TextChangedP',
+    'TextChangedT', 'TextYankPost', 'UIEnter', 'UILeave', 'User',
+    'UserGettingBored', 'VimEnter', 'VimLeave', 'VimLeavePre', 'VimResized',
+    'VimResume', 'VimSuspend', 'WinClosed', 'WinEnter', 'WinLeave', 'WinNew',
+    'WinResized', 'WinScrolled',
+  }) do
+    known_events[event] = true
+  end
+
+  -- Events whose pattern is matched against a buffer name.
+  local buffer_events = {
+    BufAdd = true, BufDelete = true, BufEnter = true, BufFilePost = true,
+    BufFilePre = true, BufHidden = true, BufLeave = true, BufNew = true,
+    BufNewFile = true, BufReadCmd = true, BufReadPost = true,
+    BufReadPre = true, BufUnload = true, BufWinEnter = true,
+    BufWinLeave = true, BufWipeout = true, BufWriteCmd = true,
+    BufWritePost = true, BufWritePre = true, FileReadCmd = true,
+    FileReadPost = true, FileReadPre = true, FileWriteCmd = true,
+    FileWritePost = true, FileWritePre = true,
+  }
+
+  local state = {
+    next_id = 1,
+    next_group = 1,
+    groups = {},       -- name -> id
+    group_names = {},  -- id -> name
+    items = {},        -- id -> record
+  }
+
+  local function glob_match(glob, text)
+    if glob == '*' then
+      return true
+    end
+    local pattern = glob:gsub('[%^%$%(%)%%%.%[%]%+%-]', '%%%1')
+    pattern = pattern:gsub('%*', '.*'):gsub('%?', '.')
+    return text:match('^' .. pattern .. '$') ~= nil
+  end
+
+  local function as_list(value)
+    if type(value) == 'table' then
+      return value
+    end
+    return { value }
+  end
+
+  local function validate_events(events)
+    local list = as_list(events)
+    for _, event in ipairs(list) do
+      if not known_events[event] then
+        api_error("Invalid 'event': '" .. tostring(event) .. "'")
+      end
+    end
+    return list
+  end
+
+  local function remove_id(id)
+    state.items[id] = nil
+  end
+
+  vim.api.nvim_create_augroup = function(name, opts)
+    opts = opts or {}
+    local id = state.groups[name]
+    if id then
+      if opts.clear then
+        for autocmd_id, record in pairs(state.items) do
+          if record.group == id then
+            state.items[autocmd_id] = nil
+          end
+        end
+      end
+      return id
+    end
+    id = state.next_group
+    state.next_group = state.next_group + 1
+    state.groups[name] = id
+    state.group_names[id] = name
+    return id
+  end
+
+  vim.api.nvim_create_autocmd = function(events, opts)
+    opts = opts or {}
+    local list = validate_events(events)
+    if opts.callback == nil and opts.command == nil then
+      api_error("Invalid 'callback': Expected Lua function or 'command'")
+    end
+    if opts.callback ~= nil and opts.command ~= nil then
+      api_error("Invalid 'callback': Cannot use both 'command' and 'callback'")
+    end
+    if opts.pattern ~= nil and opts.buffer ~= nil then
+      api_error("Conflict: 'pattern' not allowed with 'buf'")
+    end
+    local group = opts.group
+    if type(group) == 'string' then
+      group = state.groups[group]
+    end
+    group = group or 0
+    local id = state.next_id
+    state.next_id = state.next_id + 1
+    local record = {
+      id = id,
+      events = list,
+      group = group,
+      pattern = opts.pattern and as_list(opts.pattern) or nil,
+      buffer = opts.buffer,
+      callback = opts.callback,
+      command = opts.command,
+      once = opts.once and true or false,
+      nested = opts.nested and true or false,
+      desc = opts.desc,
+    }
+    state.items[id] = record
+    return id
+  end
+
+  vim.api.nvim_del_autocmd = function(id)
+    remove_id(id)
+  end
+
+  local function contains(list, value)
+    for _, item in ipairs(list) do
+      if item == value then
+        return true
+      end
+    end
+    return false
+  end
+
+  local function record_has_event(record, event)
+    for _, value in ipairs(record.events) do
+      if value == event then
+        return true
+      end
+    end
+    return false
+  end
+
+  local function record_matches_pattern(record, patterns)
+    if not record.pattern then
+      return false
+    end
+    for _, expected in ipairs(patterns) do
+      for _, glob in ipairs(record.pattern) do
+        if glob == expected or glob_match(glob, expected) then
+          return true
+        end
+      end
+    end
+    return record.pattern[1] == '*'
+  end
+
+  vim.api.nvim_get_autocmds = function(filter)
+    filter = filter or {}
+    local event_filter = filter.event and validate_events(filter.event) or nil
+    local pattern_filter = filter.pattern and as_list(filter.pattern) or nil
+    local entries = {}
+    for _, record in pairs(state.items) do
+      local event_ok = true
+      if event_filter then
+        event_ok = false
+        for _, event in ipairs(event_filter) do
+          if record_has_event(record, event) then
+            event_ok = true
+            break
+          end
+        end
+      end
+      local group_ok = filter.group == nil or record.group == filter.group
+      local buffer_ok = filter.buffer == nil or record.buffer == filter.buffer
+      local pattern_ok = true
+      if pattern_filter then
+        pattern_ok = record_matches_pattern(record, pattern_filter)
+      end
+      if event_ok and group_ok and buffer_ok and pattern_ok then
+        for _, event in ipairs(record.events) do
+          if not event_filter or contains(event_filter, event) then
+            entries[#entries + 1] = {
+              id = record.id,
+              event = event,
+              group = record.group,
+              pattern = record.pattern and record.pattern[1] or nil,
+              command = record.command or '',
+              callback = record.callback,
+              once = record.once,
+              nested = record.nested,
+              desc = record.desc,
+              buffer = record.buffer,
+            }
+          end
+        end
+      end
+    end
+    table.sort(entries, function(a, b)
+      if a.event == b.event then
+        return a.id < b.id
+      end
+      return a.event < b.event
+    end)
+    return entries
+  end
+
+  local function buffer_name_for(buf)
+    local name = vim.api.nvim_buf_get_name(buf)
+    if name == '' then
+      return ''
+    end
+    local cwd = vim.fn.getcwd()
+    if cwd ~= '' and name:sub(1, #cwd + 1) == cwd .. '/' then
+      return name:sub(#cwd + 2)
+    end
+    return name
+  end
+
+  vim._exec_autocmds = function(event, opts)
+    opts = opts or {}
+    local events = validate_events(event)
+    local buffer = opts.buffer
+    if buffer == nil or buffer == 0 then
+      buffer = vim.api.nvim_get_current_buf()
+    end
+    local patterns = opts.pattern and as_list(opts.pattern) or nil
+    for _, single_event in ipairs(events) do
+      local candidates = patterns
+      if not candidates then
+        if buffer_events[single_event] then
+          candidates = { buffer_name_for(buffer) }
+        else
+          candidates = { opts.pattern or '' }
+        end
+      end
+      local snapshot = {}
+      for _, record in pairs(state.items) do
+        if record_has_event(record, single_event) then
+          snapshot[#snapshot + 1] = record
+        end
+      end
+      table.sort(snapshot, function(a, b)
+        return a.id < b.id
+      end)
+      for _, record in ipairs(snapshot) do
+        local matches = false
+        local match_text = candidates[1] or ''
+        if record.buffer then
+          matches = record.buffer == buffer
+          if matches and patterns then
+            match_text = patterns[1]
+          end
+        else
+          for _, candidate in ipairs(candidates) do
+            if record.pattern and record.pattern[1] then
+              for _, glob in ipairs(record.pattern) do
+                if glob == '*' or glob == candidate or glob_match(glob, candidate) then
+                  matches = true
+                  match_text = candidate
+                  break
+                end
+              end
+            end
+            if matches then
+              break
+            end
+          end
+        end
+        if matches and state.items[record.id] then
+          if record.once then
+            state.items[record.id] = nil
+          end
+          local args = {
+            id = record.id,
+            event = single_event,
+            match = match_text,
+            buf = buffer,
+            file = vim.api.nvim_buf_get_name(buffer),
+            data = opts.data,
+          }
+          if record.command then
+            exec_cmd(record.command)
+          elseif record.callback then
+            record.callback(args)
+          end
+        end
+      end
+    end
+  end
+
+  vim.api.nvim_exec_autocmds = function(event, opts)
+    vim._exec_autocmds(event, opts)
+  end
+
+  vim.api.nvim_clear_autocmds = function(opts)
+    opts = opts or {}
+    local event_filter = opts.event and validate_events(opts.event) or nil
+    local pattern_filter = opts.pattern and as_list(opts.pattern) or nil
+    for id, record in pairs(state.items) do
+      local remove = true
+      if event_filter then
+        remove = false
+        for _, event in ipairs(event_filter) do
+          if record_has_event(record, event) then
+            remove = true
+            break
+          end
+        end
+      end
+      if remove and opts.group ~= nil and record.group ~= opts.group then
+        remove = false
+      end
+      if remove and opts.buffer ~= nil and record.buffer ~= opts.buffer then
+        remove = false
+      end
+      if remove and pattern_filter and not record_matches_pattern(record, pattern_filter) then
+        remove = false
+      end
+      if remove then
+        state.items[id] = nil
+      end
     end
   end
 end
