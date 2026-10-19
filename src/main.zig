@@ -364,8 +364,18 @@ fn loadUserConfig(L: *c.lua_State, init_file: ?[]const u8) bool {
     return true;
 }
 
+/// Identity for the `vim.NIL` sentinel Neovim uses for JSON null.
+var g_nil_sentinel: u8 = 0;
+
+fn pushNilSentinel(L: *c.lua_State) void {
+    c.lua_pushlightuserdata(L, @ptrCast(&g_nil_sentinel));
+}
+
 fn registerVimGlobal(L: *c.lua_State) !void {
     c.lua_newtable(L);
+
+    pushNilSentinel(L);
+    c.lua_setfield(L, -2, "NIL");
 
     c.lua_newtable(L);
     regApi(L);
@@ -389,6 +399,8 @@ fn registerVimGlobal(L: *c.lua_State) !void {
     c.lua_setfield(L, -2, "wait");
     c.lua_pushcfunction(L, luaInspect);
     c.lua_setfield(L, -2, "inspect");
+    c.lua_pushcfunction(L, luaPathType);
+    c.lua_setfield(L, -2, "_path_type");
     c.lua_pushcfunction(L, luaBufGetShortName);
     c.lua_setfield(L, -2, "_buf_short_name");
     c.lua_pushcfunction(L, luaBufGetModified);
@@ -409,6 +421,30 @@ fn registerVimGlobal(L: *c.lua_State) !void {
     c.lua_setfield(L, -2, "cwd");
     c.lua_pushcfunction(L, luaUvOsHomedir);
     c.lua_setfield(L, -2, "os_homedir");
+    c.lua_pushcfunction(L, luaUvOsGetenv);
+    c.lua_setfield(L, -2, "os_getenv");
+    c.lua_pushcfunction(L, luaUvOsSetenv);
+    c.lua_setfield(L, -2, "os_setenv");
+    c.lua_pushcfunction(L, luaUvOsUnsetenv);
+    c.lua_setfield(L, -2, "os_unsetenv");
+    c.lua_pushcfunction(L, luaUvHrtime);
+    c.lua_setfield(L, -2, "hrtime");
+    c.lua_pushcfunction(L, luaUvNow);
+    c.lua_setfield(L, -2, "now");
+    c.lua_pushcfunction(L, luaUvSleep);
+    c.lua_setfield(L, -2, "sleep");
+    c.lua_pushcfunction(L, luaUvFsRealpath);
+    c.lua_setfield(L, -2, "fs_realpath");
+    c.lua_pushcfunction(L, luaUvFsMkdir);
+    c.lua_setfield(L, -2, "fs_mkdir");
+    c.lua_pushcfunction(L, luaUvFsUnlink);
+    c.lua_setfield(L, -2, "fs_unlink");
+    c.lua_pushcfunction(L, luaUvFsRmdir);
+    c.lua_setfield(L, -2, "fs_rmdir");
+    c.lua_pushcfunction(L, luaUvFsStat);
+    c.lua_setfield(L, -2, "fs_stat");
+    c.lua_pushcfunction(L, luaUvFsScandir);
+    c.lua_setfield(L, -2, "fs_scandir");
     c.lua_setfield(L, -2, "uv");
 
     c.lua_newtable(L);
@@ -502,6 +538,28 @@ fn luaCreateBuf(L: ?*c.lua_State) callconv(.c) c_int {
         c.lua_pushinteger(LS, @as(c.lua_Integer, @intCast(id)));
     } else {
         c.lua_pushinteger(LS, 1);
+    }
+    return 1;
+}
+
+/// "file", "dir", or "" — mirrors what vim.fn.getftype reports for a path.
+fn luaPathType(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const path = c.luaL_checklstring(LS, 1, null);
+    var req: c.uv_fs_t = std.mem.zeroes(c.uv_fs_t);
+    const result = c.uv_fs_stat(getLoop(), &req, path, null);
+    defer _ = c.uv_fs_req_cleanup(&req);
+    if (result < 0) {
+        c.lua_pushstring(LS, "");
+        return 1;
+    }
+    const mode: u64 = req.statbuf.st_mode;
+    if ((mode & c.S_IFMT) == c.S_IFDIR) {
+        c.lua_pushstring(LS, "dir");
+    } else if ((mode & c.S_IFMT) == c.S_IFREG) {
+        c.lua_pushstring(LS, "file");
+    } else {
+        c.lua_pushstring(LS, "other");
     }
     return 1;
 }
@@ -1179,8 +1237,169 @@ fn luaUvOsHomedir(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn luaUvOsGetenv(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const name = c.luaL_checklstring(LS, 1, null);
+    var buf: [4096]u8 = undefined;
+    var size: usize = buf.len;
+    const result = c.uv_os_getenv(name, &buf, &size);
+    if (result == c.UV_ENOENT) {
+        c.lua_pushnil(LS);
+        return 1;
+    }
+    if (result != 0) {
+        c.lua_pushnil(LS);
+        return 1;
+    }
+    const len = std.mem.indexOfScalar(u8, &buf, 0) orelse size;
+    c.lua_pushlstring(LS, &buf, len);
+    return 1;
+}
+
+fn luaUvOsSetenv(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const name = c.luaL_checklstring(LS, 1, null);
+    const value = c.luaL_checklstring(LS, 2, null);
+    c.lua_pushboolean(LS, if (c.uv_os_setenv(name, value) == 0) 1 else 0);
+    return 1;
+}
+
+fn luaUvOsUnsetenv(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const name = c.luaL_checklstring(LS, 1, null);
+    c.lua_pushboolean(LS, if (c.uv_os_unsetenv(name) == 0) 1 else 0);
+    return 1;
+}
+
+fn luaUvHrtime(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    c.lua_pushnumber(LS, @floatFromInt(c.uv_hrtime()));
+    return 1;
+}
+
+fn luaUvNow(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    c.lua_pushnumber(LS, @floatFromInt(c.uv_now(getLoop())));
+    return 1;
+}
+
+fn luaUvSleep(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const ms = c.luaL_checkinteger(LS, 1);
+    if (ms > 0) c.uv_sleep(@intCast(ms));
+    return 0;
+}
+
+fn luaUvFsRealpath(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const path = c.luaL_checklstring(LS, 1, null);
+    var req: c.uv_fs_t = std.mem.zeroes(c.uv_fs_t);
+    const result = c.uv_fs_realpath(getLoop(), &req, path, null);
+    defer _ = c.uv_fs_req_cleanup(&req);
+    if (result != 0 or req.ptr == null) {
+        c.lua_pushnil(LS);
+        return 1;
+    }
+    const resolved: [*:0]const u8 = @ptrCast(req.ptr.?);
+    c.lua_pushstring(LS, resolved);
+    return 1;
+}
+
+fn fsResultString(L: *c.lua_State, result: c_int) c_int {
+    if (result == 0) {
+        c.lua_pushnil(L);
+        return 1;
+    }
+    c.lua_pushstring(L, c.uv_strerror(result));
+    return 1;
+}
+
+fn luaUvFsMkdir(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const path = c.luaL_checklstring(LS, 1, null);
+    const mode: c_int = @intCast(c.luaL_optinteger(LS, 2, 0o777));
+    var req: c.uv_fs_t = std.mem.zeroes(c.uv_fs_t);
+    const result = c.uv_fs_mkdir(getLoop(), &req, path, mode, null);
+    defer _ = c.uv_fs_req_cleanup(&req);
+    return fsResultString(LS, result);
+}
+
+fn luaUvFsUnlink(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const path = c.luaL_checklstring(LS, 1, null);
+    var req: c.uv_fs_t = std.mem.zeroes(c.uv_fs_t);
+    const result = c.uv_fs_unlink(getLoop(), &req, path, null);
+    defer _ = c.uv_fs_req_cleanup(&req);
+    return fsResultString(LS, result);
+}
+
+fn luaUvFsRmdir(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const path = c.luaL_checklstring(LS, 1, null);
+    var req: c.uv_fs_t = std.mem.zeroes(c.uv_fs_t);
+    const result = c.uv_fs_rmdir(getLoop(), &req, path, null);
+    defer _ = c.uv_fs_req_cleanup(&req);
+    return fsResultString(LS, result);
+}
+
+fn luaUvFsStat(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const path = c.luaL_checklstring(LS, 1, null);
+    var req: c.uv_fs_t = std.mem.zeroes(c.uv_fs_t);
+    const result = c.uv_fs_stat(getLoop(), &req, path, null);
+    defer _ = c.uv_fs_req_cleanup(&req);
+    if (result != 0) {
+        c.lua_pushnil(LS);
+        return 1;
+    }
+    const mode: u64 = req.statbuf.st_mode;
+    c.lua_newtable(LS);
+    if ((mode & c.S_IFMT) == c.S_IFDIR) {
+        c.lua_pushstring(LS, "directory");
+    } else if ((mode & c.S_IFMT) == c.S_IFREG) {
+        c.lua_pushstring(LS, "file");
+    } else if ((mode & c.S_IFMT) == c.S_IFLNK) {
+        c.lua_pushstring(LS, "link");
+    } else {
+        c.lua_pushstring(LS, "other");
+    }
+    c.lua_setfield(LS, -2, "type");
+    c.lua_pushnumber(LS, @floatFromInt(req.statbuf.st_size));
+    c.lua_setfield(LS, -2, "size");
+    c.lua_pushnumber(LS, @floatFromInt(req.statbuf.st_mtim.tv_sec));
+    c.lua_setfield(LS, -2, "mtime");
+    return 1;
+}
+
+fn luaUvFsScandir(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const path = c.luaL_checklstring(LS, 1, null);
+    var req: c.uv_fs_t = std.mem.zeroes(c.uv_fs_t);
+    const result = c.uv_fs_scandir(getLoop(), &req, path, 0, null);
+    defer _ = c.uv_fs_req_cleanup(&req);
+    if (result < 0) {
+        c.lua_pushnil(LS);
+        return 1;
+    }
+    c.lua_newtable(LS);
+    var entry: c.uv_dirent_t = undefined;
+    var index: c_int = 1;
+    while (c.uv_fs_scandir_next(&req, &entry) != c.UV_EOF) {
+        c.lua_pushstring(LS, entry.name);
+        c.lua_rawseti(LS, -2, index);
+        index += 1;
+    }
+    return 1;
+}
+
 fn luaMpackEncode(L: ?*c.lua_State) callconv(.c) c_int {
     const LS: *c.lua_State = @ptrCast(L.?);
+    // Neovim refuses to encode a bare nil: there is nothing to write.
+    if (c.lua_gettop(LS) < 1 or c.lua_type(LS, 1) == c.LUA_TNIL) {
+        c.lua_pushstring(LS, "can't serialize object of type 0");
+        _ = c.lua_error(LS);
+        return 0;
+    }
     const allocator = std.heap.page_allocator;
     var buf = std.ArrayList(u8).initCapacity(allocator, 0) catch unreachable;
     defer buf.deinit(allocator);
@@ -1250,6 +1469,13 @@ fn luaValueToMpack(L: *c.lua_State, idx: c_int, buf: *std.ArrayList(u8)) !void {
             const str = c.lua_tolstring(L, abs, &len);
             if (str != null) try msgpack.encodeString(a, buf, str[0..len]);
         },
+        c.LUA_TLIGHTUSERDATA => {
+            if (c.lua_touserdata(L, abs) == @as(?*anyopaque, @ptrCast(&g_nil_sentinel))) {
+                try msgpack.encodeNil(a, buf);
+            } else {
+                return error.UnsupportedType;
+            }
+        },
         c.LUA_TTABLE => {
             const len = c.lua_objlen(L, abs);
             if (len > 0) {
@@ -1278,7 +1504,7 @@ fn luaValueToMpack(L: *c.lua_State, idx: c_int, buf: *std.ArrayList(u8)) !void {
 
 fn mpackValueToLua(L: *c.lua_State, v: msgpack.Value) void {
     switch (v) {
-        .nil => c.lua_pushnil(L),
+        .nil => pushNilSentinel(L),
         .boolean => |b| c.lua_pushboolean(L, if (b) 1 else 0),
         .int => |i| c.lua_pushinteger(L, i),
         .uint => |u| c.lua_pushinteger(L, @as(c.lua_Integer, @intCast(u))),

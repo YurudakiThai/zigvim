@@ -10,6 +10,30 @@ local function api_error(msg)
   error(msg, 0)
 end
 
+-- Neovim's own shared library provides vim.tbl_*, vim.list_*, vim.split,
+-- vim.trim, vim.deep_equal and friends. Prefer it over reimplementing them.
+if type(vim.NIL) == 'nil' then
+  vim.NIL = {}
+end
+local ok_shared = pcall(require, 'vim._core.shared')
+if ok_shared then
+  local ok_inspect, inspect = pcall(require, 'vim.inspect')
+  if ok_inspect then
+    vim.inspect = inspect
+  end
+end
+
+if vim.stricmp == nil then
+  -- Case-insensitive comparison with C strcmp-style -1/0/1 results.
+  function vim.stricmp(a, b)
+    local la, lb = tostring(a):lower(), tostring(b):lower()
+    if la == lb then
+      return 0
+    end
+    return la < lb and -1 or 1
+  end
+end
+
 -- ---------------------------------------------------------------- vim.json
 local json = {}
 
@@ -46,6 +70,9 @@ local encode_value
 
 function encode_value(v)
   local t = type(v)
+  if vim.NIL ~= nil and v == vim.NIL then
+    return 'null'
+  end
   if t == 'nil' then
     return 'null'
   elseif t == 'boolean' then
@@ -230,7 +257,7 @@ function decode_value(s, i)
   elseif s:sub(i, i + 4) == 'false' then
     return false, i + 5
   elseif s:sub(i, i + 3) == 'null' then
-    return nil, i + 4
+    return vim.NIL, i + 4
   else
     local num = s:match('^-?%d+%.?%d*[eE]?[-+]?%d*', i)
     if not num or num == '' then
@@ -254,6 +281,60 @@ vim.json = json
 -- ------------------------------------------------------------- vim.version
 vim.version = function()
   return { major = 0, minor = 1, patch = 0 }
+end
+
+-- ---------------------------------------------------------- vim.log/notify
+vim.log = vim.log or {}
+vim.log.levels = {
+  TRACE = 0,
+  DEBUG = 1,
+  INFO = 2,
+  WARN = 3,
+  ERROR = 4,
+  OFF = 5,
+}
+
+local notified_once = {}
+
+-- Deprecated APIs call this; keep the warning once per name and report as
+-- Neovim does (true means the deprecated path was taken).
+vim._deprecation_warned = vim._deprecation_warned or {}
+function vim.deprecate(name, alternative, version, plugin, backtrace)
+  local key = tostring(name)
+  if not vim._deprecation_warned[key] then
+    vim._deprecation_warned[key] = true
+    local msg = name .. ' is deprecated'
+    if alternative and alternative ~= '' then
+      msg = msg .. '. Use ' .. alternative .. ' instead'
+    end
+    if version and version ~= '' then
+      msg = msg .. '. Feature will be removed in version ' .. tostring(version)
+    end
+    io.stderr:write(msg .. '\n')
+  end
+  return true
+end
+
+function vim.notify(msg, level, opts)
+  level = level or vim.log.levels.INFO
+  local prefix = ({
+    [vim.log.levels.TRACE] = 'TRACE',
+    [vim.log.levels.DEBUG] = 'DEBUG',
+    [vim.log.levels.INFO] = 'INFO',
+    [vim.log.levels.WARN] = 'WARN',
+    [vim.log.levels.ERROR] = 'ERROR',
+  })[level]
+  io.stderr:write((prefix and (prefix .. ': ') or '') .. tostring(msg) .. '\n')
+  return nil
+end
+
+function vim.notify_once(msg, level, opts)
+  local key = tostring(msg)
+  if notified_once[key] then
+    return nil
+  end
+  notified_once[key] = true
+  return vim.notify(msg, level, opts)
 end
 
 -- ------------------------------------------------------------- vim.inspect
@@ -415,6 +496,24 @@ vim.wo = setmetatable({}, {
 })
 
 -- ------------------------------------------------------------- variables
+vim.env = setmetatable({}, {
+  __index = function(_, k)
+    return os.getenv(k)
+  end,
+  __newindex = function(_, k, v)
+    k = tostring(k)
+    if v == nil then
+      if vim.uv.os_unsetenv then
+        vim.uv.os_unsetenv(k)
+      else
+        vim.uv.os_setenv(k, '')
+      end
+    else
+      vim.uv.os_setenv(k, tostring(v))
+    end
+  end,
+})
+
 vim.g = setmetatable({}, {
   __index = function() end,
   __newindex = function(t, k, v)
@@ -523,16 +622,18 @@ local function xdg(kind, fallback)
 end
 
 function vim.fn.stdpath(what)
+  -- Match Neovim's directories so user configs and LazyVim distributions are
+  -- picked up unchanged.
   if what == 'config' then
-    return xdg('XDG_CONFIG_HOME', '/.config') .. '/zigvim'
+    return xdg('XDG_CONFIG_HOME', '/.config') .. '/nvim'
   elseif what == 'data' then
-    return xdg('XDG_DATA_HOME', '/.local/share') .. '/zigvim'
+    return xdg('XDG_DATA_HOME', '/.local/share') .. '/nvim'
   elseif what == 'state' then
-    return xdg('XDG_STATE_HOME', '/.local/state') .. '/zigvim'
+    return xdg('XDG_STATE_HOME', '/.local/state') .. '/nvim'
   elseif what == 'cache' then
-    return xdg('XDG_CACHE_HOME', '/.cache') .. '/zigvim'
+    return xdg('XDG_CACHE_HOME', '/.cache') .. '/nvim'
   elseif what == 'log' then
-    return xdg('XDG_STATE_HOME', '/.local/state') .. '/zigvim/log'
+    return xdg('XDG_STATE_HOME', '/.local/state') .. '/nvim/log'
   end
   return ''
 end
@@ -593,6 +694,124 @@ function vim.fn.expand(expr)
   return expr
 end
 
+function vim.fn.line(expr)
+  expr = tostring(expr)
+  if expr == '$' then
+    return vim.api.nvim_buf_line_count(0)
+  end
+  if expr == '.' or expr == 'w0' or expr == 'w$' then
+    return vim.api.nvim_win_get_cursor(0)[1]
+  end
+  return tonumber(expr) or 0
+end
+
+function vim.fn.col(expr)
+  expr = tostring(expr)
+  if expr == '$' then
+    local lines = vim.api.nvim_buf_get_lines(0, vim.api.nvim_win_get_cursor(0)[1] - 1, vim.api.nvim_win_get_cursor(0)[1], false)
+    return #(lines[1] or '') + 1
+  end
+  if expr == '.' then
+    return vim.api.nvim_win_get_cursor(0)[2] + 1
+  end
+  return tonumber(expr) or 0
+end
+
+function vim.fn.getpos(expr)
+  local row, col = vim.api.nvim_win_get_cursor(0)[1], vim.api.nvim_win_get_cursor(0)[2]
+  return { vim.api.nvim_get_current_buf(), row, col + 1, 0 }
+end
+
+local function normalize_pos(pos)
+  if pos == nil then
+    return nil
+  end
+  if type(pos) == 'table' and pos[1] == 'v' then
+    return nil
+  end
+  local buf = tonumber(pos[1]) or 0
+  if buf == 0 then
+    buf = vim.api.nvim_get_current_buf()
+  end
+  return { buf, tonumber(pos[2]) or 1, tonumber(pos[3]) or 1, tonumber(pos[4]) or 0 }
+end
+
+function vim.fn.getregionpos(pos1, pos2, opts)
+  opts = opts or {}
+  local start = normalize_pos(pos1)
+  local finish = normalize_pos(pos2)
+  if not start or not finish then
+    return {}
+  end
+  local regtype = opts.type or 'v'
+  local exclusive = opts.exclusive ~= false
+  local buf = start[1]
+  local lines = vim.api.nvim_buf_get_lines(math.max(buf - 1, 0), 0, -1, false)
+  local maxcol = vim.v.maxcol
+
+  local function line_length(lnum)
+    return #(lines[lnum] or '')
+  end
+
+  local regions = {}
+  if regtype == 'V' then
+    for lnum = start[2], finish[2] do
+      regions[#regions + 1] = { { buf, lnum, 1, 0 }, { buf, lnum, maxcol, 0 } }
+    end
+    return regions
+  end
+
+  if regtype == 'blockwise' or regtype == '\22' then
+    local col1, col2 = start[3], finish[3]
+    if col1 > col2 then
+      col1, col2 = col2, col1
+    end
+    if exclusive then
+      col2 = col2 - 1
+    end
+    for lnum = start[2], finish[2] do
+      local endcol = math.min(col2, line_length(lnum))
+      regions[#regions + 1] = { { buf, lnum, col1, 0 }, { buf, lnum, endcol, 0 } }
+    end
+    return regions
+  end
+
+  local from, to = start, finish
+  if to[2] < from[2] or (to[2] == from[2] and to[3] < from[3]) then
+    from, to = to, from
+  end
+  local endcol = to[3]
+  if exclusive then
+    endcol = endcol - 1
+  end
+  if endcol < 1 then
+    return {}
+  end
+  regions[1] = { { buf, from[2], from[3], 0 }, { buf, to[2], endcol, 0 } }
+  return regions
+end
+
+function vim.fn.setpos(expr, pos)
+  vim.api.nvim_win_set_cursor(0, { pos[2] or 1, math.max((pos[3] or 1) - 1, 0) })
+  return 0
+end
+
+function vim.fn.getcurpos()
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  return { vim.api.nvim_get_current_buf(), cursor[1], cursor[2] + 1, 0, cursor[2] + 1 }
+end
+
+function vim.fn.cursor(...)
+  local args = { ... }
+  if type(args[1]) == 'table' then
+    args = args[1]
+  end
+  local row = tonumber(args[1]) or vim.api.nvim_win_get_cursor(0)[1]
+  local col = tonumber(args[2]) or 1
+  vim.api.nvim_win_set_cursor(0, { row, math.max(col - 1, 0) })
+  return 0
+end
+
 function vim.fn.filereadable(path)
   local f = io.open(path, 'r')
   if f then
@@ -612,6 +831,37 @@ end
 
 function vim.fn.exists(expr)
   if expr == '*vim' or expr == 'g:zigvim' then
+    return 1
+  end
+  return 0
+end
+
+function vim.fn.getftype(path)
+  return vim._path_type(tostring(path))
+end
+
+function vim.fn.isdirectory(path)
+  if vim.fn.getftype(path) == 'dir' then
+    return 1
+  end
+  return 0
+end
+
+function vim.fn.mkdir(path, flags)
+  path = tostring(path)
+  local command
+  if vim.uv.os_uname().sysname:match('Windows') then
+    command = (flags == 'p' or flags == 'p!')
+        and ('if not exist "' .. path .. '" mkdir "' .. path .. '" 2>nul')
+      or ('mkdir "' .. path .. '" 2>nul')
+  else
+    command = "mkdir " .. ((flags == 'p' or flags == 'p!') and '-p ' or '')
+      .. "'"
+      .. path:gsub("'", "'\\''")
+      .. "' 2>/dev/null"
+  end
+  local ok = os.execute(command)
+  if ok == true or ok == 0 then
     return 1
   end
   return 0
@@ -852,6 +1102,59 @@ vim.api.nvim_buf_is_loaded = function(buf)
   return vim.api.nvim_buf_is_valid(buf)
 end
 
+local buffer_attach_callbacks = {}
+
+vim.api.nvim_buf_attach = function(buf, send_buffer, opts)
+  buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+  local callbacks = buffer_attach_callbacks[buf]
+  if not callbacks then
+    callbacks = {}
+    buffer_attach_callbacks[buf] = callbacks
+  end
+  callbacks[#callbacks + 1] = opts or {}
+  return true
+end
+
+vim.api.nvim_buf_detach = function(buf)
+  buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+  buffer_attach_callbacks[buf] = nil
+  return true
+end
+
+local function fire_buf_attach(buf, firstline, lastline, new_lastline)
+  local callbacks = buffer_attach_callbacks[buf]
+  if not callbacks then
+    return
+  end
+  for _, opts in ipairs(callbacks) do
+    if opts.on_lines then
+      opts.on_lines(nil, buf, nil, firstline, lastline, new_lastline)
+    end
+  end
+end
+
+vim.api.nvim_win_call = function(win, fn)
+  local prev = vim.api.nvim_get_current_win()
+  vim.api.nvim_set_current_win(win)
+  local ok, result = pcall(fn)
+  vim.api.nvim_set_current_win(prev)
+  if not ok then
+    error(result)
+  end
+  return result
+end
+
+-- Native helper Neovim's shared library uses for vim._with().
+vim._with_c = function(context, fn)
+  if context.buf then
+    return vim.api.nvim_buf_call(context.buf, fn)
+  end
+  if context.win then
+    return vim.api.nvim_win_call(context.win, fn)
+  end
+  return fn()
+end
+
 vim.api.nvim_buf_call = function(buf, fn)
   local prev = vim.api.nvim_get_current_buf()
   vim.api.nvim_set_current_buf(buf)
@@ -881,7 +1184,50 @@ end
 -- ----------------------------------------------------------- variables API
 local window_vars = {}
 local tab_vars = {}
-local vvars = { version = 0, lua = true }
+local vvars = {
+  version = 801,
+  lua = true,
+  maxcol = 2147483647,
+  numbermax = 9223372036854775807,
+  numbermin = -9223372036854775808,
+  errmsg = '',
+  shell_error = 0,
+  count = 0,
+  count1 = 1,
+  prevcount = 0,
+  hlsearch = 1,
+  searchforward = 1,
+  register = '"',
+  operator = '',
+  dying = 0,
+  exception = '',
+  statusmsg = '',
+  warningmsg = '',
+  scrollstart = '',
+  this_session = '',
+  termresponse = '',
+  servername = '',
+  progpath = '',
+  argv = {},
+  errors = {},
+  oldfiles = {},
+  completed_item = {},
+  event = {},
+  windowid = 0,
+  mouse_win = 0,
+  mouse_lnum = 0,
+  mouse_col = 0,
+  echospace = 0,
+  beval_bufnr = 0,
+  beval_lnum = 0,
+  beval_col = 0,
+  beval_text = '',
+  beval_winnr = 0,
+  charconvert_from = '',
+  charconvert_to = '',
+  ['true'] = true,
+  ['false'] = false,
+}
 
 local function var_table(kind, id)
   if kind == 'g' then
@@ -894,9 +1240,6 @@ local function var_table(kind, id)
     end
     return vars
   elseif kind == 'w' then
-    if id == vim.api.nvim_get_current_win() then
-      return vim.w
-    end
     local vars = window_vars[id]
     if not vars then
       vars = {}
@@ -904,9 +1247,6 @@ local function var_table(kind, id)
     end
     return vars
   elseif kind == 't' then
-    if id == vim.api.nvim_get_current_tabpage() then
-      return vim.t
-    end
     local vars = tab_vars[id]
     if not vars then
       vars = {}
@@ -957,6 +1297,32 @@ end
 vim.api.nvim_set_vvar = function(name, value)
   vvars[name] = value
 end
+
+-- v: , w: and t: proxies over the same storage the API uses.
+vim.v = setmetatable({}, {
+  __index = function(_, k)
+    return vvars[k]
+  end,
+  __newindex = function(_, k, v)
+    vvars[k] = v
+  end,
+})
+vim.w = setmetatable({}, {
+  __index = function(_, k)
+    return var_table('w', vim.api.nvim_get_current_win())[k]
+  end,
+  __newindex = function(_, k, v)
+    var_table('w', vim.api.nvim_get_current_win())[k] = v
+  end,
+})
+vim.t = setmetatable({}, {
+  __index = function(_, k)
+    return var_table('t', vim.api.nvim_get_current_tabpage())[k]
+  end,
+  __newindex = function(_, k, v)
+    var_table('t', vim.api.nvim_get_current_tabpage())[k] = v
+  end,
+})
 
 vim.api.nvim_buf_get_var = function(buf, name)
   buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
@@ -1321,6 +1687,20 @@ do
     vim.api[name] = function(buf, ...)
       return raw(check_buf(buf), ...)
     end
+  end
+
+  local raw_set_lines = vim.api.nvim_buf_set_lines
+  vim.api.nvim_buf_set_lines = function(buf, start, end_, strict, lines)
+    local id = check_buf(buf)
+    local result = raw_set_lines(id, start, end_, strict, lines)
+    local count = 0
+    if type(lines) == 'table' then
+      for _ in pairs(lines) do
+        count = count + 1
+      end
+    end
+    fire_buf_attach(id, start, end_, start + count)
+    return result
   end
 
   vim.api.nvim_buf_get_short_name = function(buf, _)
@@ -1732,4 +2112,357 @@ do
       end
     end
   end
+end
+
+-- ------------------------------------------------------- namespaces and HL
+do
+  local namespace_names = {}
+  local next_namespace = 1
+
+  vim.api.nvim_create_namespace = function(name)
+    if name == nil or name == '' then
+      local id = next_namespace
+      next_namespace = next_namespace + 1
+      return id
+    end
+    local id = namespace_names[name]
+    if id then
+      return id
+    end
+    id = next_namespace
+    next_namespace = next_namespace + 1
+    namespace_names[name] = id
+    return id
+  end
+
+  vim.api.nvim_get_namespaces = function()
+    local out = {}
+    for name, id in pairs(namespace_names) do
+      out[name] = id
+    end
+    return out
+  end
+
+  local named_colors = {
+    black = 0x000000, darkblue = 0x00008b, darkgreen = 0x006400,
+    darkcyan = 0x008b8b, darkred = 0x8b0000, darkmagenta = 0x8b008b,
+    brown = 0xa52a2a, darkyellow = 0xbbbb00, lightgray = 0xd3d3d3,
+    lightgrey = 0xd3d3d3, gray = 0x808080, grey = 0x808080,
+    darkgray = 0xa9a9a9, darkgrey = 0xa9a9a9, blue = 0x0000ff,
+    lightblue = 0xadd8e6, green = 0x00ff00, lightgreen = 0x90ee90,
+    cyan = 0x00ffff, lightcyan = 0xe0ffff, red = 0xff0000,
+    lightred = 0xffbbbb, magenta = 0xff00ff, lightmagenta = 0xffbbff,
+    yellow = 0xffff00, lightyellow = 0xffffe0, white = 0xffffff,
+    darkgrey2 = 0x808080,
+  }
+
+  local function color_value(value)
+    if type(value) == 'number' then
+      return value
+    end
+    if type(value) ~= 'string' then
+      return nil
+    end
+    local hex = value:match('^#(%x%x%x%x%x%x)$')
+    if hex then
+      return tonumber(hex, 16)
+    end
+    local short = value:match('^#(%x%x%x)$')
+    if short then
+      local r, g, b = short:sub(1, 1), short:sub(2, 2), short:sub(3, 3)
+      return tonumber(r .. r .. g .. g .. b .. b, 16)
+    end
+    return named_colors[value:lower()]
+  end
+
+  local attr_keys = {
+    'bold', 'italic', 'underline', 'undercurl', 'underdouble', 'underdotted',
+    'underdashed', 'strikethrough', 'reverse', 'standout', 'nocombine',
+    'altfont', 'dim', 'blink',
+  }
+
+  local highlight_groups = {}
+  local next_hl_id = 1
+  local hl_ids = {}
+
+  vim.api.nvim_get_hl_id_by_name = function(name)
+    local id = hl_ids[name]
+    if not id then
+      id = next_hl_id
+      next_hl_id = next_hl_id + 1
+      hl_ids[name] = id
+    end
+    return id
+  end
+
+  vim.api.nvim_set_hl = function(ns, name, val)
+    val = val or {}
+    local group = highlight_groups[name] or {}
+    if val.link and val.link ~= '' then
+      group.link = val.link
+      group.fg = nil
+      group.bg = nil
+      group.sp = nil
+    else
+      group.link = nil
+      for _, key in ipairs({ 'fg', 'bg', 'sp', 'foreground', 'background', 'special' }) do
+        if val[key] ~= nil then
+          local target = key
+          if key == 'foreground' then
+            target = 'fg'
+          elseif key == 'background' then
+            target = 'bg'
+          elseif key == 'special' then
+            target = 'sp'
+          end
+          group[target] = color_value(val[key]) or group[target]
+        end
+      end
+      for _, key in ipairs(attr_keys) do
+        if val[key] ~= nil then
+          group[key] = val[key] and true or nil
+        end
+      end
+      if val.cterm ~= nil then
+        local cterm = {}
+        for _, key in ipairs({ 'fg', 'bg', 'sp' }) do
+          if val.cterm[key] ~= nil then
+            cterm[key] = color_value(val.cterm[key]) or val.cterm[key]
+          end
+        end
+        for _, key in ipairs(attr_keys) do
+          if val.cterm[key] ~= nil then
+            cterm[key] = val.cterm[key] and true or nil
+          end
+        end
+        if next(cterm) ~= nil then
+          group.cterm = cterm
+        end
+      end
+      if val.default then
+        group.default = true
+      end
+    end
+    highlight_groups[name] = group
+    return 0
+  end
+
+  vim.api.nvim_get_hl = function(ns, opts)
+    opts = opts or {}
+    local function copy_group(group)
+      local copy = {}
+      for key, value in pairs(group) do
+        if type(value) == 'table' then
+          local nested = {}
+          for k, v in pairs(value) do
+            nested[k] = v
+          end
+          copy[key] = nested
+        else
+          copy[key] = value
+        end
+      end
+      return copy
+    end
+    if opts.name ~= nil then
+      local group = highlight_groups[opts.name]
+      if not group then
+        return {}
+      end
+      local copy = copy_group(group)
+      if opts.link == false then
+        copy.link = nil
+      end
+      return copy
+    end
+    local out = {}
+    for name, group in pairs(highlight_groups) do
+      local copy = copy_group(group)
+      if opts.link == false then
+        copy.link = nil
+      end
+      out[name] = copy
+    end
+    return out
+  end
+
+  vim.api.nvim_set_hl_ns = function(ns) end
+  vim.api.nvim_win_set_hl_ns = function(win, ns) end
+  vim.api.nvim_get_hl_ns = function(_) return 0 end
+end
+
+-- Load Neovim's shipped runtime modules that build on the API above.
+package.preload['vim.uv'] = function()
+  return vim.uv
+end
+package.preload['vim.loop'] = function()
+  return vim.uv
+end
+
+do
+  local modules = {
+    'vim.F', 'vim.func', 'vim.fs', 'vim.iter', 'vim.text', 'vim.re', 'vim.pos',
+    'vim.range', 'vim.net', 'vim.filetype', 'vim.secure', 'vim.pack',
+    'vim.health', 'vim.loader', 'vim._watch', 'vim.version', 'vim.hl',
+    'vim.diagnostic', 'vim.keymap', 'vim.lsp',
+  }
+  for _, mod in ipairs(modules) do
+    local field = mod:sub(5)
+    if vim[field] == nil then
+      local ok, lib = pcall(require, mod)
+      if ok and lib ~= nil then
+        vim[field] = lib
+      end
+    end
+  end
+end
+
+-- ----------------------------------------------------------- extmarks API
+do
+  local extmarks = {}      -- buffer id -> namespace id -> { id -> mark }
+  local next_extmark_id = 1
+
+  local function ns_marks(buf, ns)
+    local per_buffer = extmarks[buf]
+    if not per_buffer then
+      per_buffer = {}
+      extmarks[buf] = per_buffer
+    end
+    local marks = per_buffer[ns]
+    if not marks then
+      marks = {}
+      per_buffer[ns] = marks
+    end
+    return marks
+  end
+
+  vim.api.nvim_buf_set_extmark = function(buf, ns, line, col, opts)
+    opts = opts or {}
+    local marks = ns_marks(buf, ns)
+    local id = opts.id or next_extmark_id
+    if not opts.id then
+      next_extmark_id = next_extmark_id + 1
+    end
+    marks[id] = {
+      id = id,
+      row = line,
+      col = col,
+      end_row = opts.end_row,
+      end_col = opts.end_col,
+      hl_group = opts.hl_group,
+      hl_eol = opts.hl_eol,
+      priority = opts.priority,
+      virt_text = opts.virt_text,
+      virt_text_pos = opts.virt_text_pos,
+      virt_lines = opts.virt_lines,
+      sign_text = opts.sign_text,
+      sign_hl_group = opts.sign_hl_group,
+      number_hl_group = opts.number_hl_group,
+      line_hl_group = opts.line_hl_group,
+      cursorline_hl_group = opts.cursorline_hl_group,
+      conceal = opts.conceal,
+      spell = opts.spell,
+      ui_watched = opts.ui_watched,
+      right_gravity = opts.right_gravity,
+      end_right_gravity = opts.end_right_gravity,
+      strict = opts.strict,
+      ephemeral = opts.ephemeral,
+    }
+    return id
+  end
+
+  vim.api.nvim_buf_get_extmarks = function(buf, ns, start, end_, opts)
+    opts = opts or {}
+    local marks = ns_marks(buf, ns)
+    local start_row = 0
+    local start_col = 0
+    if type(start) == 'table' then
+      start_row, start_col = start[1] or 0, start[2] or 0
+    else
+      start_row = start or 0
+    end
+    local end_row, end_col
+    if end_ == nil or end_ == -1 then
+      end_row, end_col = math.huge, math.huge
+    elseif type(end_) == 'table' then
+      end_row, end_col = end_[1] or 0, end_[2] or 0
+    else
+      end_row, end_col = end_, math.huge
+    end
+    local out = {}
+    for _, mark in pairs(marks) do
+      local after_start = mark.row > start_row or (mark.row == start_row and (mark.col or 0) >= start_col)
+      local before_end = mark.row < end_row or (mark.row == end_row and (mark.col or 0) <= end_col)
+      if (opts.type == nil or true) and after_start and before_end then
+        if opts.details then
+          local details = { }
+          for _, key in ipairs({
+            'end_row', 'end_col', 'hl_group', 'hl_eol', 'priority', 'virt_text',
+            'virt_text_pos', 'virt_lines', 'sign_text', 'sign_hl_group',
+            'number_hl_group', 'line_hl_group', 'cursorline_hl_group', 'conceal',
+            'spell', 'ui_watched', 'right_gravity', 'end_right_gravity',
+          }) do
+            details[key] = mark[key]
+          end
+          out[#out + 1] = { mark.id, mark.row, mark.col, details }
+        else
+          out[#out + 1] = { mark.id, mark.row, mark.col }
+        end
+      end
+    end
+    table.sort(out, function(a, b)
+      if a[2] == b[2] then
+        if a[3] == b[3] then
+          return a[1] < b[1]
+        end
+        return a[3] < b[3]
+      end
+      return a[2] < b[2]
+    end)
+    return out
+  end
+
+  vim.api.nvim_buf_get_extmark_by_id = function(buf, ns, id, opts)
+    opts = opts or {}
+    local marks = ns_marks(buf, ns)
+    local mark = marks[id]
+    if not mark then
+      return {}
+    end
+    if opts.details then
+      return { mark.row, mark.col, { end_row = mark.end_row, end_col = mark.end_col, hl_group = mark.hl_group } }
+    end
+    return { mark.row, mark.col }
+  end
+
+  vim.api.nvim_buf_del_extmark = function(buf, ns, id)
+    local marks = ns_marks(buf, ns)
+    if marks[id] == nil then
+      return false
+    end
+    marks[id] = nil
+    return true
+  end
+
+  vim.api.nvim_buf_clear_namespace = function(buf, ns, line_start, line_end)
+    local buffer_marks = extmarks[buf] or {}
+    if ns == -1 then
+      for _, marks in pairs(buffer_marks) do
+        for id, mark in pairs(marks) do
+          if mark.row >= line_start and mark.row < line_end then
+            marks[id] = nil
+          end
+        end
+      end
+      return
+    end
+    local marks = ns_marks(buf, ns)
+    for id, mark in pairs(marks) do
+      if mark.row >= line_start and mark.row < line_end then
+        marks[id] = nil
+      end
+    end
+  end
+
+  vim.api.nvim_create_namespace = vim.api.nvim_create_namespace
 end
