@@ -467,6 +467,7 @@ fn regApi(L: *c.lua_State) void {
         .{ .name = "nvim_tabpage_get_number", .f = @ptrCast(&luaTabpageGetNumber) },
         .{ .name = "nvim_tabpage_get_win", .f = @ptrCast(&luaTabpageGetWin) },
         .{ .name = "nvim_tabpage_is_valid", .f = @ptrCast(&luaTabpageIsValid) },
+        .{ .name = "nvim_strwidth", .f = @ptrCast(&luaStrWidth) },
         .{ .name = "nvim_get_current_line", .f = @ptrCast(&luaGetCurrentLine) },
         .{ .name = "nvim_set_current_line", .f = @ptrCast(&luaSetCurrentLine) },
         .{ .name = "nvim_del_current_line", .f = @ptrCast(&luaDelCurrentLine) },
@@ -506,11 +507,15 @@ fn luaCreateBuf(L: ?*c.lua_State) callconv(.c) c_int {
 }
 
 fn resolveBufId(id: i64) u32 {
-    return if (id == 0) g_current_buf else @intCast(id);
+    if (id == 0) return g_current_buf;
+    if (id < 0 or id > std.math.maxInt(u32)) return 0;
+    return @intCast(id);
 }
 
 fn resolveWinId(id: i64) u32 {
-    return if (id == 0) g_current_win else @intCast(id);
+    if (id == 0) return g_current_win;
+    if (id < 0 or id > std.math.maxInt(u32)) return 0;
+    return @intCast(id);
 }
 
 fn luaBufIsValid(L: ?*c.lua_State) callconv(.c) c_int {
@@ -794,6 +799,69 @@ fn luaTabpageIsValid(L: ?*c.lua_State) callconv(.c) c_int {
     const LS: *c.lua_State = @ptrCast(L.?);
     const id = c.luaL_checkinteger(LS, 1);
     c.lua_pushboolean(LS, if (id == 0 or id == @as(c.lua_Integer, @intCast(g_current_tab))) 1 else 0);
+    return 1;
+}
+
+/// Display width of a code point in terminal cells, following the same rules
+/// Neovim uses (combining marks are zero width, East Asian characters double).
+fn codepointCells(cp: u21) u3 {
+    if ((cp >= 0x0300 and cp <= 0x036f) or
+        (cp >= 0x0483 and cp <= 0x0489) or
+        (cp >= 0x1ab0 and cp <= 0x1aff) or
+        (cp >= 0x1dc0 and cp <= 0x1dff) or
+        (cp >= 0x20d0 and cp <= 0x20ff) or
+        (cp >= 0xfe20 and cp <= 0xfe2f) or
+        (cp >= 0x200b and cp <= 0x200f) or cp == 0xfeff)
+    {
+        return 0;
+    }
+    if ((cp >= 0x1100 and cp <= 0x115f) or
+        (cp >= 0x231a and cp <= 0x231b) or
+        (cp >= 0x23e9 and cp <= 0x23ec) or
+        (cp >= 0x2e80 and cp <= 0xa4cf and cp != 0x303f) or
+        (cp >= 0xac00 and cp <= 0xd7a3) or
+        (cp >= 0xf900 and cp <= 0xfaff) or
+        (cp >= 0xfe10 and cp <= 0xfe19) or
+        (cp >= 0xfe30 and cp <= 0xfe6f) or
+        (cp >= 0xff00 and cp <= 0xff60) or
+        (cp >= 0xffe0 and cp <= 0xffe6) or
+        (cp >= 0x1f300 and cp <= 0x1f64f) or
+        (cp >= 0x1f900 and cp <= 0x1f9ff) or
+        (cp >= 0x20000 and cp <= 0x3fffd))
+    {
+        return 2;
+    }
+    return 1;
+}
+
+fn luaStrWidth(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    if (c.lua_type(LS, 1) != c.LUA_TSTRING) {
+        c.lua_pushstring(LS, "Invalid 'text': Expected Lua string");
+        _ = c.lua_error(LS);
+        return 0;
+    }
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(LS, 1, &len) orelse return 0;
+    const text = ptr[0..len];
+    var width: i64 = 0;
+    var i: usize = 0;
+    while (i < text.len and text[i] != 0) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        if (i + seq_len > text.len) {
+            width += 1;
+            i += 1;
+            continue;
+        }
+        const cp = std.unicode.utf8Decode(text[i .. i + seq_len]) catch {
+            width += 1;
+            i += 1;
+            continue;
+        };
+        width += codepointCells(cp);
+        i += seq_len;
+    }
+    c.lua_pushinteger(LS, @intCast(width));
     return 1;
 }
 

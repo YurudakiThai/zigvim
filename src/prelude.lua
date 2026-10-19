@@ -4,6 +4,12 @@
 -- Make Neovim's shipped runtime modules available (vim.inspect, vim.iter, ...).
 package.path = "runtime/lua/?.lua;runtime/lua/?/init.lua;" .. package.path
 
+-- Neovim raises API errors without a Lua source position prefix (the message
+-- comes from the C API layer). Use level 0 so pcall() sees the same text.
+local function api_error(msg)
+  error(msg, 0)
+end
+
 -- ---------------------------------------------------------------- vim.json
 local json = {}
 
@@ -300,8 +306,22 @@ local option_defaults = {
 }
 
 local option_store = {}
+
+local function check_option(name)
+  if name == nil or option_defaults[name] == nil then
+    api_error("Unknown option '" .. tostring(name) .. "'")
+  end
+end
+
+local function check_buf_option(name)
+  if name == nil or option_defaults[name] == nil then
+    api_error("Invalid option name: '" .. tostring(name) .. "'")
+  end
+end
+
 local option_mt = {
   __index = function(_, k)
+    check_option(k)
     local v = option_store[k]
     if v ~= nil then
       return v
@@ -309,6 +329,7 @@ local option_mt = {
     return option_defaults[k]
   end,
   __newindex = function(_, k, v)
+    check_option(k)
     option_store[k] = v
   end,
 }
@@ -330,6 +351,7 @@ local function buf_opt_get(id, k)
   if opts and opts[k] ~= nil then
     return opts[k]
   end
+  check_buf_option(k)
   return option_defaults[k]
 end
 
@@ -338,6 +360,7 @@ local function buf_opt_set(id, k, v)
     vim._buf_set_modified(id, v)
     return
   end
+  check_buf_option(k)
   local opts = buffer_options[id]
   if not opts then
     opts = {}
@@ -373,14 +396,21 @@ vim.bo = setmetatable({}, {
 local window_options = {}
 vim.wo = setmetatable({}, {
   __index = function(_, k)
+    check_option(k)
     local v = window_options[k]
+    if v ~= nil then
+      return v
+    end
+    v = option_store[k]
     if v ~= nil then
       return v
     end
     return option_defaults[k]
   end,
   __newindex = function(_, k, v)
+    check_option(k)
     window_options[k] = v
+    option_store[k] = v
   end,
 })
 
@@ -736,18 +766,45 @@ local function exec_cmd(cmd)
     end
     local value = chunk()
     io.stdout:write(tostring(value) .. '\n')
+  elseif vim._user_commands and vim._user_commands[name] then
+    local user_cmd = vim._user_commands[name]
+    local opts = { name = name, args = rest, line1 = 1, line2 = 1, bang = false }
+    if type(user_cmd.command) == 'function' then
+      user_cmd.command(opts)
+    else
+      exec_cmd((tostring(user_cmd.command):gsub('<q%-args>', rest):gsub('<args>', rest)))
+    end
   else
-    error('E492: Not an editor command: ' .. cmd)
+    api_error('E492: Not an editor command: ' .. cmd)
+  end
+end
+
+-- Run each line, adding the same context Neovim attaches when a command is
+-- executed through vim.cmd(). API callers (nvim_command / nvim_exec2) get the
+-- bare "Vim:..." form instead.
+local function exec_lines(cmd, wrap)
+  if type(cmd) == 'table' then
+    cmd = cmd.cmd or cmd[1]
+  end
+  local line_number = 0
+  for line in tostring(cmd):gmatch('[^\n]+') do
+    line_number = line_number + 1
+    local ok, err = pcall(exec_cmd, line)
+    if not ok then
+      local msg = tostring(err)
+      if msg:sub(1, 4) ~= 'Vim:' then
+        msg = 'Vim:' .. msg
+      end
+      if wrap then
+        msg = '[string "vim/_core/editor"]:353: nvim_exec2(), line ' .. line_number .. ': ' .. msg
+      end
+      api_error(msg)
+    end
   end
 end
 
 function vim.cmd(cmd)
-  if type(cmd) == 'table' then
-    cmd = cmd.cmd or cmd[1]
-  end
-  for line in tostring(cmd):gmatch('[^\n]+') do
-    exec_cmd(line)
-  end
+  exec_lines(cmd, true)
 end
 
 local function exec_lua(code, args)
@@ -759,11 +816,11 @@ local function exec_lua(code, args)
 end
 
 vim.api.nvim_command = function(cmd)
-  vim.cmd(cmd)
+  exec_lines(cmd, false)
 end
 
 vim.api.nvim_exec2 = function(src, _)
-  vim.cmd(src)
+  exec_lines(src, false)
   return { output = '' }
 end
 
@@ -799,4 +856,513 @@ function vim._load_init()
     io.stderr:write('Error in init.lua: ' .. tostring(err) .. '\n')
   end
   return true
+end
+
+-- ----------------------------------------------------------- variables API
+local window_vars = {}
+local tab_vars = {}
+local vvars = { version = 0, lua = true }
+
+local function var_table(kind, id)
+  if kind == 'g' then
+    return vim.g
+  elseif kind == 'b' then
+    local vars = buffer_vars[id]
+    if not vars then
+      vars = {}
+      buffer_vars[id] = vars
+    end
+    return vars
+  elseif kind == 'w' then
+    if id == vim.api.nvim_get_current_win() then
+      return vim.w
+    end
+    local vars = window_vars[id]
+    if not vars then
+      vars = {}
+      window_vars[id] = vars
+    end
+    return vars
+  elseif kind == 't' then
+    if id == vim.api.nvim_get_current_tabpage() then
+      return vim.t
+    end
+    local vars = tab_vars[id]
+    if not vars then
+      vars = {}
+      tab_vars[id] = vars
+    end
+    return vars
+  end
+  return {}
+end
+
+local function get_var(kind, id, name)
+  local value = var_table(kind, id)[name]
+  if value == nil then
+    api_error('Key not found: ' .. name)
+  end
+  return value
+end
+
+local function set_var(kind, id, name, value)
+  var_table(kind, id)[name] = value
+end
+
+local function del_var(kind, id, name)
+  local vars = var_table(kind, id)
+  if vars[name] == nil then
+    api_error('Key not found: ' .. name)
+  end
+  vars[name] = nil
+end
+
+vim.api.nvim_get_var = function(name)
+  return get_var('g', nil, name)
+end
+vim.api.nvim_set_var = function(name, value)
+  set_var('g', nil, name, value)
+end
+vim.api.nvim_del_var = function(name)
+  del_var('g', nil, name)
+end
+
+vim.api.nvim_get_vvar = function(name)
+  local value = vvars[name]
+  if value == nil then
+    api_error('Key not found: ' .. name)
+  end
+  return value
+end
+vim.api.nvim_set_vvar = function(name, value)
+  vvars[name] = value
+end
+
+vim.api.nvim_buf_get_var = function(buf, name)
+  buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+  return get_var('b', buf, name)
+end
+vim.api.nvim_buf_set_var = function(buf, name, value)
+  buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+  set_var('b', buf, name, value)
+end
+vim.api.nvim_buf_del_var = function(buf, name)
+  buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+  del_var('b', buf, name)
+end
+
+vim.api.nvim_win_get_var = function(win, name)
+  win = win == 0 and vim.api.nvim_get_current_win() or win
+  return get_var('w', win, name)
+end
+vim.api.nvim_win_set_var = function(win, name, value)
+  win = win == 0 and vim.api.nvim_get_current_win() or win
+  set_var('w', win, name, value)
+end
+vim.api.nvim_win_del_var = function(win, name)
+  win = win == 0 and vim.api.nvim_get_current_win() or win
+  del_var('w', win, name)
+end
+
+vim.api.nvim_tabpage_get_var = function(tab, name)
+  tab = tab == 0 and vim.api.nvim_get_current_tabpage() or tab
+  return get_var('t', tab, name)
+end
+vim.api.nvim_tabpage_set_var = function(tab, name, value)
+  tab = tab == 0 and vim.api.nvim_get_current_tabpage() or tab
+  set_var('t', tab, name, value)
+end
+vim.api.nvim_tabpage_del_var = function(tab, name)
+  tab = tab == 0 and vim.api.nvim_get_current_tabpage() or tab
+  del_var('t', tab, name)
+end
+
+-- ------------------------------------------------------------- options API
+local function option_value(name, opts)
+  opts = opts or {}
+  check_option(name)
+  if opts.buf and opts.buf ~= 0 then
+    return buf_opt_get(opts.buf, name)
+  elseif opts.win and opts.win ~= 0 then
+    local value = window_options[name]
+    if value == nil then
+      value = option_store[name]
+    end
+    if value ~= nil then
+      return value
+    end
+    return option_defaults[name]
+  end
+  if name == 'modified' and (opts.buf or opts.scope == 'local') then
+    return vim.bo.modified
+  end
+  local value = option_store[name]
+  if value ~= nil then
+    return value
+  end
+  if opts.buf or opts.win then
+    return vim.bo[name]
+  end
+  return option_defaults[name]
+end
+
+local function set_option_value(name, value, opts)
+  opts = opts or {}
+  check_option(name)
+  if opts.buf and opts.buf ~= 0 then
+    buf_opt_set(opts.buf, name, value)
+  elseif opts.win and opts.win ~= 0 then
+    window_options[name] = value
+    option_store[name] = value
+  else
+    option_store[name] = value
+  end
+end
+
+vim.api.nvim_get_option_value = function(name, opts)
+  return option_value(name, opts)
+end
+vim.api.nvim_set_option_value = function(name, value, opts)
+  set_option_value(name, value, opts)
+end
+vim.api.nvim_get_option = function(name)
+  return option_value(name, {})
+end
+vim.api.nvim_set_option = function(name, value)
+  set_option_value(name, value, {})
+end
+vim.api.nvim_buf_get_option = function(buf, name)
+  buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+  check_buf_option(name)
+  return buf_opt_get(buf, name)
+end
+vim.api.nvim_buf_set_option = function(buf, name, value)
+  buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+  check_buf_option(name)
+  buf_opt_set(buf, name, value)
+end
+vim.api.nvim_win_get_option = function(win, name)
+  check_buf_option(name)
+  local value = window_options[name]
+  if value == nil then
+    value = option_store[name]
+  end
+  if value ~= nil then
+    return value
+  end
+  return option_defaults[name]
+end
+vim.api.nvim_win_set_option = function(win, name, value)
+  check_buf_option(name)
+  window_options[name] = value
+  option_store[name] = value
+end
+vim.api.nvim_get_all_options_info = function()
+  local info = {}
+  for name in pairs(option_defaults) do
+    info[name] = { name = name, type = type(option_defaults[name]) }
+  end
+  return info
+end
+
+-- ------------------------------------------------------------- keymaps API
+local keymaps = {}
+local buffer_keymaps = {}
+
+local function norm_mode(mode)
+  if mode == '' or mode == nil then
+    return 'n'
+  end
+  return mode
+end
+
+local function find_keymap(list, lhs)
+  for _, map in ipairs(list) do
+    if map.lhs == lhs then
+      return map
+    end
+  end
+  return nil
+end
+
+local function make_keymap(mode, lhs, rhs, opts)
+  opts = opts or {}
+  local map = {
+    lhs = lhs,
+    mode = norm_mode(mode),
+    noremap = (opts.noremap == true or opts.remap ~= true) and 1 or 0,
+    silent = opts.silent and 1 or 0,
+    desc = opts.desc,
+    callback = type(rhs) == 'function' and rhs or nil,
+    rhs = type(rhs) == 'function' and '' or tostring(rhs or ''),
+  }
+  return map
+end
+
+vim.api.nvim_set_keymap = function(mode, lhs, rhs, opts)
+  local map = make_keymap(mode, lhs, rhs, opts)
+  local list = keymaps[map.mode] or {}
+  keymaps[map.mode] = list
+  local existing = find_keymap(list, lhs)
+  if existing then
+    for key, value in pairs(map) do
+      existing[key] = value
+    end
+  else
+    list[#list + 1] = map
+  end
+end
+
+vim.api.nvim_get_keymap = function(mode)
+  local list = keymaps[norm_mode(mode)] or {}
+  local copy = {}
+  for i, map in ipairs(list) do
+    copy[i] = map
+  end
+  return copy
+end
+
+vim.api.nvim_del_keymap = function(mode, lhs)
+  local list = keymaps[norm_mode(mode)]
+  if list then
+    for i, map in ipairs(list) do
+      if map.lhs == lhs then
+        table.remove(list, i)
+        return
+      end
+    end
+  end
+  api_error('E31: No such mapping')
+end
+
+local function buf_keymap_list(buf, mode)
+  local per_buffer = buffer_keymaps[buf]
+  if not per_buffer then
+    per_buffer = {}
+    buffer_keymaps[buf] = per_buffer
+  end
+  local list = per_buffer[norm_mode(mode)]
+  if not list then
+    list = {}
+    per_buffer[norm_mode(mode)] = list
+  end
+  return list
+end
+
+vim.api.nvim_buf_set_keymap = function(buf, mode, lhs, rhs, opts)
+  buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+  local list = buf_keymap_list(buf, mode)
+  local map = make_keymap(mode, lhs, rhs, opts)
+  local existing = find_keymap(list, lhs)
+  if existing then
+    for key, value in pairs(map) do
+      existing[key] = value
+    end
+  else
+    list[#list + 1] = map
+  end
+end
+
+vim.api.nvim_buf_get_keymap = function(buf, mode)
+  buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+  return buf_keymap_list(buf, mode)
+end
+
+vim.api.nvim_buf_del_keymap = function(buf, mode, lhs)
+  buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+  local list = buf_keymap_list(buf, mode)
+  for i, map in ipairs(list) do
+    if map.lhs == lhs then
+      table.remove(list, i)
+      return
+    end
+  end
+  api_error('E31: No such mapping')
+end
+
+vim.keymap = {
+  set = function(modes, lhs, rhs, opts)
+    opts = opts or {}
+    local mode_list = type(modes) == 'table' and modes or { modes }
+    for _, mode in ipairs(mode_list) do
+      if opts.buffer then
+        vim.api.nvim_buf_set_keymap(opts.buffer == true and 0 or opts.buffer, mode, lhs, rhs, opts)
+      else
+        vim.api.nvim_set_keymap(mode, lhs, rhs, opts)
+      end
+    end
+  end,
+  del = function(modes, lhs, opts)
+    opts = opts or {}
+    local mode_list = type(modes) == 'table' and modes or { modes }
+    for _, mode in ipairs(mode_list) do
+      if opts.buffer then
+        vim.api.nvim_buf_del_keymap(opts.buffer == true and 0 or opts.buffer, mode, lhs)
+      else
+        vim.api.nvim_del_keymap(mode, lhs)
+      end
+    end
+  end,
+}
+
+-- -------------------------------------------------------- user commands API
+vim._user_commands = {}
+local user_commands = vim._user_commands
+local buffer_user_commands = {}
+
+vim.api.nvim_create_user_command = function(name, command, opts)
+  user_commands[name] = {
+    name = name,
+    command = command,
+    nargs = (opts and opts.nargs) or 0,
+    desc = opts and opts.desc,
+  }
+end
+
+vim.api.nvim_del_user_command = function(name)
+  if user_commands[name] == nil then
+    api_error('Invalid command (not found): ' .. tostring(name))
+  end
+  user_commands[name] = nil
+end
+
+vim.api.nvim_get_commands = function(_)
+  local out = {}
+  for name, cmd in pairs(user_commands) do
+    out[name] = { name = name, nargs = tostring(cmd.nargs), desc = cmd.desc }
+  end
+  return out
+end
+
+vim.api.nvim_buf_create_user_command = function(buf, name, command, opts)
+  buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+  buffer_user_commands[buf] = buffer_user_commands[buf] or {}
+  buffer_user_commands[buf][name] = { command = command, opts = opts }
+end
+
+vim.api.nvim_buf_del_user_command = function(buf, name)
+  buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+  local cmds = buffer_user_commands[buf]
+  if not cmds or cmds[name] == nil then
+    api_error('Invalid command (not found): ' .. tostring(name))
+  end
+  cmds[name] = nil
+end
+
+-- ------------------------------------------------- API argument validation
+-- The Zig-backed primitives resolve ids leniently; Neovim raises for invalid
+-- handles. Wrap them once so every entry point reports the same error text.
+do
+  local function check_buf(buf)
+    local id = (buf == nil or buf == 0) and vim.api.nvim_get_current_buf() or buf
+    if not vim.api.nvim_buf_is_valid(id) then
+      api_error('Invalid buffer id: ' .. tostring(buf))
+    end
+    return id
+  end
+
+  local function check_win(win)
+    local id = (win == nil or win == 0) and vim.api.nvim_get_current_win() or win
+    if not vim.api.nvim_win_is_valid(id) then
+      api_error('Invalid window id: ' .. tostring(win))
+    end
+    return id
+  end
+
+  local function check_tab(tab)
+    local id = (tab == nil or tab == 0) and vim.api.nvim_get_current_tabpage() or tab
+    if not vim.api.nvim_tabpage_is_valid(id) then
+      api_error('Invalid tabpage id: ' .. tostring(tab))
+    end
+    return id
+  end
+
+  local buf_funcs = {
+    'nvim_buf_get_lines',
+    'nvim_buf_set_lines',
+    'nvim_buf_line_count',
+    'nvim_buf_get_name',
+    'nvim_buf_set_name',
+    'nvim_buf_delete',
+    'nvim_buf_get_var',
+    'nvim_buf_set_var',
+    'nvim_buf_del_var',
+    'nvim_buf_get_option',
+    'nvim_buf_set_option',
+    'nvim_buf_get_keymap',
+    'nvim_buf_set_keymap',
+    'nvim_buf_del_keymap',
+    'nvim_buf_call',
+    'nvim_buf_create_user_command',
+    'nvim_buf_del_user_command',
+  }
+  for _, name in ipairs(buf_funcs) do
+    local raw = vim.api[name]
+    vim.api[name] = function(buf, ...)
+      return raw(check_buf(buf), ...)
+    end
+  end
+
+  vim.api.nvim_buf_get_short_name = function(buf, _)
+    return vim._buf_short_name(check_buf(buf))
+  end
+
+  local win_funcs = {
+    'nvim_win_get_cursor',
+    'nvim_win_get_height',
+    'nvim_win_get_width',
+    'nvim_win_get_position',
+    'nvim_win_get_number',
+    'nvim_win_get_buf',
+    'nvim_win_get_var',
+    'nvim_win_set_var',
+    'nvim_win_del_var',
+    'nvim_win_get_option',
+    'nvim_win_set_option',
+  }
+  for _, name in ipairs(win_funcs) do
+    local raw = vim.api[name]
+    vim.api[name] = function(win, ...)
+      return raw(check_win(win), ...)
+    end
+  end
+
+  local raw_win_set_buf = vim.api.nvim_win_set_buf
+  vim.api.nvim_win_set_buf = function(win, buf)
+    return raw_win_set_buf(check_win(win), check_buf(buf))
+  end
+
+  local raw_win_set_cursor = vim.api.nvim_win_set_cursor
+  vim.api.nvim_win_set_cursor = function(win, pos)
+    local id = check_win(win)
+    local line_count = vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(id))
+    if type(pos) ~= 'table' or type(pos[1]) ~= 'number' or pos[1] < 1 or pos[1] > line_count then
+      api_error('Invalid cursor line: out of range')
+    end
+    return raw_win_set_cursor(id, pos)
+  end
+
+  local raw_set_current_buf = vim.api.nvim_set_current_buf
+  vim.api.nvim_set_current_buf = function(buf)
+    return raw_set_current_buf(check_buf(buf))
+  end
+
+  local raw_set_current_win = vim.api.nvim_set_current_win
+  vim.api.nvim_set_current_win = function(win)
+    return raw_set_current_win(check_win(win))
+  end
+
+  local tab_funcs = {
+    'nvim_tabpage_get_var',
+    'nvim_tabpage_set_var',
+    'nvim_tabpage_del_var',
+    'nvim_tabpage_get_win',
+    'nvim_tabpage_get_number',
+  }
+  for _, name in ipairs(tab_funcs) do
+    local raw = vim.api[name]
+    vim.api[name] = function(tab, ...)
+      return raw(check_tab(tab), ...)
+    end
+  end
 end
