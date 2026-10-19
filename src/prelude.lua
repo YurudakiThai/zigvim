@@ -290,6 +290,10 @@ local option_defaults = {
   background = 'light',
   filetype = '',
   syntax = '',
+  buftype = '',
+  buflisted = true,
+  readonly = false,
+  modified = false,
   termguicolors = false,
   mouse = '',
   clipboard = '',
@@ -311,6 +315,74 @@ local option_mt = {
 
 vim.o = setmetatable({}, option_mt)
 vim.opt = setmetatable({}, option_mt)
+vim.opt_local = vim.opt
+vim.opt_global = vim.opt
+
+-- Buffer-local options. `modified` is authoritative in the Zig core; the
+-- rest live in this Lua table until the option registry moves down.
+local buffer_options = {}
+
+local function buf_opt_get(id, k)
+  if k == 'modified' then
+    return vim._buf_modified(id)
+  end
+  local opts = buffer_options[id]
+  if opts and opts[k] ~= nil then
+    return opts[k]
+  end
+  return option_defaults[k]
+end
+
+local function buf_opt_set(id, k, v)
+  if k == 'modified' then
+    vim._buf_set_modified(id, v)
+    return
+  end
+  local opts = buffer_options[id]
+  if not opts then
+    opts = {}
+    buffer_options[id] = opts
+  end
+  opts[k] = v
+end
+
+local function make_bo(id)
+  return setmetatable({}, {
+    __index = function(_, k)
+      return buf_opt_get(id, k)
+    end,
+    __newindex = function(_, k, v)
+      buf_opt_set(id, k, v)
+    end,
+  })
+end
+
+vim.bo = setmetatable({}, {
+  __index = function(_, k)
+    if type(k) == 'number' then
+      return make_bo(k == 0 and vim.api.nvim_get_current_buf() or k)
+    end
+    return buf_opt_get(vim.api.nvim_get_current_buf(), k)
+  end,
+  __newindex = function(_, k, v)
+    buf_opt_set(vim.api.nvim_get_current_buf(), k, v)
+  end,
+})
+
+-- Window-local options (a single window for now).
+local window_options = {}
+vim.wo = setmetatable({}, {
+  __index = function(_, k)
+    local v = window_options[k]
+    if v ~= nil then
+      return v
+    end
+    return option_defaults[k]
+  end,
+  __newindex = function(_, k, v)
+    window_options[k] = v
+  end,
+})
 
 -- ------------------------------------------------------------- variables
 vim.g = setmetatable({}, {
@@ -405,4 +477,326 @@ function vim.defer_fn(fn, ms)
     fn()
   end)
   return timer
+end
+
+-- --------------------------------------------------------------- vim.fn
+local function home_dir()
+  return os.getenv('HOME') or os.getenv('USERPROFILE') or '/'
+end
+
+local function xdg(kind, fallback)
+  local env = os.getenv(kind)
+  if env and env ~= '' then
+    return env
+  end
+  return home_dir() .. fallback
+end
+
+function vim.fn.stdpath(what)
+  if what == 'config' then
+    return xdg('XDG_CONFIG_HOME', '/.config') .. '/zigvim'
+  elseif what == 'data' then
+    return xdg('XDG_DATA_HOME', '/.local/share') .. '/zigvim'
+  elseif what == 'state' then
+    return xdg('XDG_STATE_HOME', '/.local/state') .. '/zigvim'
+  elseif what == 'cache' then
+    return xdg('XDG_CACHE_HOME', '/.cache') .. '/zigvim'
+  elseif what == 'log' then
+    return xdg('XDG_STATE_HOME', '/.local/state') .. '/zigvim/log'
+  end
+  return ''
+end
+
+function vim.fn.getcwd()
+  return vim.uv.cwd()
+end
+
+local function basename(path)
+  return (path:gsub('/+$', ''):match('([^/]+)$')) or path
+end
+
+local function dirname(path)
+  local dir = path:match('^(.*)/[^/]*$')
+  if dir == '' then
+    return '/'
+  end
+  return dir or '.'
+end
+
+function vim.fn.fnamemodify(path, modifiers)
+  path = tostring(path)
+  for mod in tostring(modifiers):gmatch(':([^:]+)') do
+    if mod == 'p' then
+      if path:sub(1, 1) ~= '/' then
+        path = vim.uv.cwd() .. '/' .. path
+      end
+    elseif mod == 'h' then
+      path = dirname(path)
+    elseif mod == 't' then
+      path = basename(path)
+    elseif mod == 'r' then
+      path = path:gsub('%.[^./]+$', '')
+    elseif mod == 'e' then
+      path = path:match('%.([^./]+)$') or ''
+    end
+  end
+  return path
+end
+
+function vim.fn.expand(expr)
+  expr = tostring(expr)
+  local name = vim._buf_short_name(0)
+  if name == '' then
+    name = vim.api.nvim_buf_get_name(0)
+  end
+  if expr == '%' then
+    return name
+  elseif expr == '%:p' then
+    return vim.fn.fnamemodify(name, ':p')
+  elseif expr == '%:t' then
+    return basename(name)
+  elseif expr == '~' then
+    return home_dir()
+  elseif expr:sub(1, 1) == '~' then
+    return home_dir() .. expr:sub(2)
+  end
+  return expr
+end
+
+function vim.fn.filereadable(path)
+  local f = io.open(path, 'r')
+  if f then
+    f:close()
+    return 1
+  end
+  return 0
+end
+
+function vim.fn.getenv(name)
+  local value = os.getenv(name)
+  if value == nil then
+    return vim.NIL
+  end
+  return value
+end
+
+function vim.fn.exists(expr)
+  if expr == '*vim' or expr == 'g:zigvim' then
+    return 1
+  end
+  return 0
+end
+
+-- ------------------------------------------------------------- vim.cmd
+local function buffer_lines()
+  return vim.api.nvim_buf_get_lines(0, 0, -1, false)
+end
+
+local function read_file(path)
+  local f = io.open(path, 'rb')
+  if not f then
+    return nil
+  end
+  local data = f:read('*a') or ''
+  f:close()
+  local lines = {}
+  for line in data:gmatch('([^\n]*)\n') do
+    lines[#lines + 1] = line:gsub('\r$', '')
+  end
+  if data ~= '' and data:sub(-1) ~= '\n' then
+    lines[#lines + 1] = data:match('([^\n]*)$'):gsub('\r$', '')
+  end
+  if #lines == 0 then
+    lines = { '' }
+  end
+  return lines
+end
+
+local function write_file(path, lines)
+  local f = io.open(path, 'wb')
+  if not f then
+    error('E212: Can\'t open file for writing: ' .. path)
+  end
+  local body
+  if #lines == 1 and lines[1] == '' then
+    body = ''
+  else
+    body = table.concat(lines, '\n') .. '\n'
+  end
+  f:write(body)
+  f:close()
+end
+
+local function edit_path(path)
+  local full = vim.fn.fnamemodify(path, ':p')
+  local lines = read_file(full)
+  vim.api.nvim_buf_set_name(0, path)
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, lines or { '' })
+  vim._buf_set_modified(0, false)
+end
+
+local function write_current(path)
+  local target
+  if path and path ~= '' then
+    vim.api.nvim_buf_set_name(0, path)
+    target = vim.fn.fnamemodify(path, ':p')
+  else
+    target = vim.api.nvim_buf_get_name(0)
+  end
+  if target == '' then
+    error('E32: No file name')
+  end
+  write_file(target, buffer_lines())
+  vim._buf_set_modified(0, false)
+end
+
+local function parse_set(arg)
+  if arg:sub(1, 3) == 'no' then
+    vim.o[arg:sub(3)] = false
+    return
+  end
+  local name, value = arg:match('^([^=]+)=(.*)$')
+  if name then
+    local num = tonumber(value)
+    if num then
+      vim.o[name] = num
+    elseif value == 'true' or value == 'false' then
+      vim.o[name] = value == 'true'
+    else
+      vim.o[name] = value
+    end
+    return
+  end
+  vim.o[arg] = true
+end
+
+local function exec_cmd(cmd)
+  cmd = cmd:gsub('^%s*:?%s*', ''):gsub('%s+$', '')
+  if cmd == '' or cmd:sub(1, 1) == '"' then
+    return
+  end
+
+  local name, rest = cmd:match('^(%S+)%s*(.*)$')
+  rest = rest or ''
+
+  if name == 'silent' or name == 'silent!' then
+    exec_cmd(rest)
+  elseif name == 'edit' or name == 'e' then
+    local path = rest ~= '' and rest or vim.api.nvim_buf_get_name(0)
+    if path == '' then
+      error('E32: No file name')
+    end
+    edit_path(path)
+  elseif name == 'write' or name == 'w' then
+    write_current(rest)
+  elseif name == 'wq' or name == 'x' or name == 'xit' then
+    if rest ~= '' then
+      write_current(rest)
+    elseif vim.bo.modified then
+      write_current('')
+    end
+  elseif name == 'q' or name == 'quit' or name == 'qa' or name == 'qall' or name == 'q!' or name == 'qa!' or name == 'qall!' then
+    -- Nothing to do: the caller decides when to stop.
+  elseif name == 'enew' then
+    local buf = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_set_current_buf(buf)
+  elseif name == 'set' then
+    for option in rest:gmatch('%S+') do
+      parse_set(option)
+    end
+  elseif name == 'setlocal' then
+    for option in rest:gmatch('%S+') do
+      local key, value = option:match('^([^=]+)=(.*)$')
+      if key then
+        vim.bo[key] = tonumber(value) or value
+      else
+        vim.bo[option] = true
+      end
+    end
+  elseif name == 'lua' then
+    local chunk, err = loadstring(rest)
+    if not chunk then
+      error(err)
+    end
+    chunk()
+  elseif name == 'let' then
+    local var, expr = rest:match('^(.-)%s*=%s*(.*)$')
+    if var == 'g:' or var:sub(1, 2) ~= 'g:' then
+      error('E121: Undefined variable: ' .. tostring(var))
+    end
+    local chunk, err = loadstring('return ' .. expr)
+    if not chunk then
+      error(err)
+    end
+    vim.g[var:sub(3)] = chunk()
+  elseif name == 'echo' then
+    local chunk, err = loadstring('return ' .. rest)
+    if not chunk then
+      error(err)
+    end
+    local value = chunk()
+    io.stdout:write(tostring(value) .. '\n')
+  else
+    error('E492: Not an editor command: ' .. cmd)
+  end
+end
+
+function vim.cmd(cmd)
+  if type(cmd) == 'table' then
+    cmd = cmd.cmd or cmd[1]
+  end
+  for line in tostring(cmd):gmatch('[^\n]+') do
+    exec_cmd(line)
+  end
+end
+
+local function exec_lua(code, args)
+  local chunk, err = loadstring(code)
+  if not chunk then
+    error(err)
+  end
+  return chunk(unpack(args or {}))
+end
+
+vim.api.nvim_command = function(cmd)
+  vim.cmd(cmd)
+end
+
+vim.api.nvim_exec2 = function(src, _)
+  vim.cmd(src)
+  return { output = '' }
+end
+
+vim.api.nvim_exec_lua = function(code, args)
+  return exec_lua(code, args)
+end
+
+vim.api.nvim_buf_is_loaded = function(buf)
+  return vim.api.nvim_buf_is_valid(buf)
+end
+
+vim.api.nvim_buf_call = function(buf, fn)
+  local prev = vim.api.nvim_get_current_buf()
+  vim.api.nvim_set_current_buf(buf)
+  local ok, result = pcall(fn)
+  vim.api.nvim_set_current_buf(prev)
+  if not ok then
+    error(result)
+  end
+  return result
+end
+
+-- Load the user's init.lua when running as an editor (not for -l scripts).
+function vim._load_init()
+  local path = vim.fn.stdpath('config') .. '/init.lua'
+  local f = io.open(path, 'r')
+  if not f then
+    return false
+  end
+  f:close()
+  local ok, err = pcall(dofile, path)
+  if not ok then
+    io.stderr:write('Error in init.lua: ' .. tostring(err) .. '\n')
+  end
+  return true
 end

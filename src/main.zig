@@ -5,6 +5,11 @@ const msgpack = @import("msgpack.zig");
 const Buffer = struct {
     id: u32,
     lines: std.ArrayList([]u8),
+    name: []u8,
+    /// Name as supplied by the user (used by expand('%')), while `name` is
+    /// the canonical absolute path reported by nvim_buf_get_name().
+    short_name: []u8,
+    modified: bool,
     valid: bool,
 };
 
@@ -29,6 +34,8 @@ const BufferStore = struct {
         while (iter.next()) |buf| {
             for (buf.lines.items) |line| self.allocator.free(line);
             buf.lines.deinit(self.allocator);
+            self.allocator.free(buf.name);
+            self.allocator.free(buf.short_name);
         }
         self.buffers.deinit();
     }
@@ -41,6 +48,9 @@ const BufferStore = struct {
         const buf = Buffer{
             .id = id,
             .lines = lines,
+            .name = try self.allocator.dupe(u8, ""),
+            .short_name = try self.allocator.dupe(u8, ""),
+            .modified = false,
             .valid = true,
         };
         try self.buffers.put(id, buf);
@@ -65,6 +75,66 @@ const BufferStore = struct {
             try buf.lines.insert(self.allocator, at, try self.allocator.dupe(u8, line));
             at += 1;
         }
+        buf.modified = true;
+    }
+
+    pub fn getModified(self: *BufferStore, id: u32) bool {
+        if (self.buffers.getPtr(id)) |buf| return buf.modified;
+        return false;
+    }
+
+    pub fn setModified(self: *BufferStore, id: u32, value: bool) void {
+        if (self.buffers.getPtr(id)) |buf| buf.modified = value;
+    }
+
+    pub fn getName(self: *BufferStore, id: u32) []const u8 {
+        if (self.buffers.getPtr(id)) |buf| return buf.name;
+        return "";
+    }
+
+    pub fn setName(self: *BufferStore, id: u32, name: []const u8) !void {
+        const buf = self.buffers.getPtr(id) orelse return error.InvalidBuffer;
+        const copy = try self.absoluteName(name);
+        const short = try self.allocator.dupe(u8, name);
+        self.allocator.free(buf.name);
+        self.allocator.free(buf.short_name);
+        buf.name = copy;
+        buf.short_name = short;
+    }
+
+    pub fn getShortName(self: *BufferStore, id: u32) []const u8 {
+        if (self.buffers.getPtr(id)) |buf| return buf.short_name;
+        return "";
+    }
+
+    /// Resolve a buffer name the way Neovim does: relative names become
+    /// absolute paths rooted at the process working directory, and existing
+    /// path components are canonicalised (e.g. /tmp -> /private/tmp).
+    pub fn absoluteName(self: *BufferStore, name: []const u8) ![]u8 {
+        if (name.len == 0) return self.allocator.dupe(u8, "");
+        const full = if (name[0] == '/')
+            try self.allocator.dupe(u8, name)
+        else
+            try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ g_cwd, name });
+
+        if (g_io) |io| {
+            if (std.Io.Dir.cwd().realPathFileAlloc(io, full, self.allocator)) |real| {
+                const copy = try self.allocator.dupe(u8, real);
+                self.allocator.free(real);
+                self.allocator.free(full);
+                return copy;
+            } else |_| {}
+
+            if (std.fs.path.dirname(full)) |dir| {
+                if (std.Io.Dir.cwd().realPathFileAlloc(io, dir, self.allocator)) |real_dir| {
+                    defer self.allocator.free(real_dir);
+                    const joined = try std.fs.path.join(self.allocator, &.{ real_dir, std.fs.path.basename(full) });
+                    self.allocator.free(full);
+                    return joined;
+                } else |_| {}
+            }
+        }
+        return full;
     }
 
     pub fn getLines(self: *BufferStore, id: u32, start: i64, end: i64) ![][]u8 {
@@ -90,6 +160,8 @@ const BufferStore = struct {
         if (self.buffers.getPtr(id)) |buf| {
             for (buf.lines.items) |line| self.allocator.free(line);
             buf.lines.deinit(self.allocator);
+            self.allocator.free(buf.name);
+            self.allocator.free(buf.short_name);
             _ = self.buffers.remove(id);
         }
     }
@@ -100,6 +172,14 @@ var g_allocator: std.mem.Allocator = std.heap.page_allocator;
 var g_callbacks: std.ArrayList(i32) = undefined;
 var g_callbacks_init: bool = false;
 var g_current_buf: u32 = 1;
+var g_current_win: u32 = 1000;
+var g_current_tab: u32 = 1;
+var g_win_buf: u32 = 1;
+var g_cursor_row: i64 = 1;
+var g_cursor_col: i64 = 0;
+var g_cwd_buf: [4096]u8 = undefined;
+var g_cwd: []const u8 = ".";
+var g_io: ?std.Io = null;
 var g_L: ?*c.lua_State = null;
 var g_loop: ?*c.uv_loop_t = null;
 
@@ -107,6 +187,8 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     g_allocator = gpa;
+    g_io = init.io;
+    initCwd();
     g_store = BufferStore.init(gpa);
     defer if (g_store) |*s| s.deinit();
 
@@ -129,7 +211,11 @@ pub fn main(init: std.process.Init) !void {
 
     var embed_mode = false;
     var lua_script: ?[]const u8 = null;
-    var lua_cmd: ?[]const u8 = null;
+    var cmds = std.ArrayList([]const u8).initCapacity(gpa, 0) catch unreachable;
+    defer cmds.deinit(gpa);
+    var file_arg: ?[]const u8 = null;
+    var clean = false;
+    var init_file: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < args.items.len) : (i += 1) {
@@ -157,7 +243,31 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("Error: -c requires command\n", .{});
                 std.process.exit(1);
             }
-            lua_cmd = args.items[i];
+            try cmds.append(gpa, args.items[i]);
+        } else if (std.mem.eql(u8, arg, "--clean")) {
+            clean = true;
+        } else if (std.mem.eql(u8, arg, "--headless") or std.mem.eql(u8, arg, "-es")) {
+            // Accepted for Neovim CLI compatibility; zigvim is API-first.
+        } else if (std.mem.eql(u8, arg, "-u")) {
+            i += 1;
+            if (i >= args.items.len) {
+                std.debug.print("Error: -u requires a vimrc path or NONE\n", .{});
+                std.process.exit(1);
+            }
+            if (std.mem.eql(u8, args.items[i], "NONE")) {
+                clean = true;
+            } else {
+                init_file = args.items[i];
+            }
+        } else if (std.mem.eql(u8, arg, "--")) {
+            i += 1;
+            if (i < args.items.len and file_arg == null) file_arg = args.items[i];
+            break;
+        } else if (arg.len > 0 and arg[0] == '-') {
+            std.debug.print("Unknown option: {s}\n", .{arg});
+            std.process.exit(1);
+        } else if (file_arg == null) {
+            file_arg = arg;
         }
     }
 
@@ -188,29 +298,70 @@ pub fn main(init: std.process.Init) !void {
             }
             std.process.exit(1);
         }
-
-        if (lua_cmd) |cmd| {
-            const is_quit = std.mem.eql(u8, cmd, "qa!") or std.mem.eql(u8, cmd, "qa") or
-                std.mem.eql(u8, cmd, "q!") or std.mem.eql(u8, cmd, "q");
-            if (!is_quit) {
-                const ccmd = try gpa.dupeSentinel(u8, cmd, 0);
-                defer gpa.free(ccmd);
-                if (c.luaL_dostring(L, ccmd)) {
-                    const err = c.lua_tolstring(L, -1, null);
-                    if (err != null) std.debug.print("{s}\n", .{std.mem.span(err)});
-                    std.process.exit(1);
-                }
-            }
+    } else if (file_arg != null or cmds.items.len > 0) {
+        // Editor mode: load configuration, open the requested file, then run
+        // the -c commands in order (Neovim CLI semantics).
+        if (!clean) {
+            _ = loadUserConfig(L, init_file);
         }
-
-        pumpEventLoop(L);
-        // Give libuv a chance to finish one-shot deferred callbacks.
-        const loop = getLoop();
-        _ = c.uv_run(loop, c.UV_RUN_NOWAIT);
+        if (file_arg) |path| {
+            const cmd = std.fmt.allocPrint(gpa, "edit {s}", .{path}) catch unreachable;
+            defer gpa.free(cmd);
+            _ = execVimCommand(L, cmd);
+        }
     } else {
-        std.debug.print("Usage: zigvim --embed | zigvim -l <script.lua> [-c <cmd>]\n", .{});
+        std.debug.print("Usage: zigvim <file> [-c <cmd>...] | zigvim -l <script.lua> [-c <cmd>...] | zigvim --embed\n", .{});
         std.process.exit(1);
     }
+
+    for (cmds.items) |cmd| {
+        _ = execVimCommand(L, cmd);
+    }
+
+    pumpEventLoop(L);
+    // Give libuv a chance to finish one-shot deferred callbacks.
+    const loop = getLoop();
+    _ = c.uv_run(loop, c.UV_RUN_NOWAIT);
+}
+
+fn execVimCommand(L: *c.lua_State, cmd: []const u8) bool {
+    c.lua_getglobal(L, "vim");
+    c.lua_getfield(L, -1, "cmd");
+    c.lua_pushlstring(L, cmd.ptr, cmd.len);
+    if (c.lua_pcall(L, 1, 0, 0) != 0) {
+        const err = c.lua_tolstring(L, -1, null);
+        if (err != null) std.debug.print("{s}\n", .{std.mem.span(err)});
+        c.lua_pop(L, 1);
+        c.lua_pop(L, 1);
+        return false;
+    }
+    c.lua_pop(L, 1);
+    return true;
+}
+
+fn loadUserConfig(L: *c.lua_State, init_file: ?[]const u8) bool {
+    if (init_file) |path| {
+        const cpath = g_allocator.dupeSentinel(u8, path, 0) catch return false;
+        defer g_allocator.free(cpath);
+        if (c.luaL_dofile(L, cpath)) {
+            const err = c.lua_tolstring(L, -1, null);
+            if (err != null) std.debug.print("Error loading {s}: {s}\n", .{ path, std.mem.span(err) });
+            c.lua_pop(L, 1);
+            return false;
+        }
+        return true;
+    }
+
+    c.lua_getglobal(L, "vim");
+    c.lua_getfield(L, -1, "_load_init");
+    if (c.lua_pcall(L, 0, 1, 0) != 0) {
+        c.lua_pop(L, 1);
+        c.lua_pop(L, 1);
+        return false;
+    }
+    c.lua_pop(L, 1);
+    c.lua_pop(L, 1);
+    return true;
 }
 
 fn registerVimGlobal(L: *c.lua_State) !void {
@@ -238,6 +389,12 @@ fn registerVimGlobal(L: *c.lua_State) !void {
     c.lua_setfield(L, -2, "wait");
     c.lua_pushcfunction(L, luaInspect);
     c.lua_setfield(L, -2, "inspect");
+    c.lua_pushcfunction(L, luaBufGetShortName);
+    c.lua_setfield(L, -2, "_buf_short_name");
+    c.lua_pushcfunction(L, luaBufGetModified);
+    c.lua_setfield(L, -2, "_buf_modified");
+    c.lua_pushcfunction(L, luaBufSetModified);
+    c.lua_setfield(L, -2, "_buf_set_modified");
 
     c.lua_newtable(L);
     c.lua_pushcfunction(L, luaUvNewTimer);
@@ -288,11 +445,32 @@ fn regApi(L: *c.lua_State) void {
         .{ .name = "nvim_buf_get_lines", .f = @ptrCast(&luaBufGetLines) },
         .{ .name = "nvim_buf_line_count", .f = @ptrCast(&luaBufLineCount) },
         .{ .name = "nvim_buf_delete", .f = @ptrCast(&luaBufDelete) },
+        .{ .name = "nvim_buf_get_name", .f = @ptrCast(&luaBufGetName) },
+        .{ .name = "nvim_buf_set_name", .f = @ptrCast(&luaBufSetName) },
         .{ .name = "nvim_get_current_buf", .f = @ptrCast(&luaGetCurrentBuf) },
         .{ .name = "nvim_set_current_buf", .f = @ptrCast(&luaSetCurrentBuf) },
         .{ .name = "nvim_get_current_win", .f = @ptrCast(&luaGetCurrentWin) },
+        .{ .name = "nvim_set_current_win", .f = @ptrCast(&luaSetCurrentWin) },
+        .{ .name = "nvim_win_get_buf", .f = @ptrCast(&luaWinGetBuf) },
+        .{ .name = "nvim_win_set_buf", .f = @ptrCast(&luaWinSetBuf) },
+        .{ .name = "nvim_win_get_cursor", .f = @ptrCast(&luaWinGetCursor) },
+        .{ .name = "nvim_win_set_cursor", .f = @ptrCast(&luaWinSetCursor) },
+        .{ .name = "nvim_win_get_height", .f = @ptrCast(&luaWinGetHeight) },
+        .{ .name = "nvim_win_get_width", .f = @ptrCast(&luaWinGetWidth) },
+        .{ .name = "nvim_win_get_position", .f = @ptrCast(&luaWinGetPosition) },
+        .{ .name = "nvim_win_get_number", .f = @ptrCast(&luaWinGetNumber) },
+        .{ .name = "nvim_win_is_valid", .f = @ptrCast(&luaWinIsValid) },
         .{ .name = "nvim_list_bufs", .f = @ptrCast(&luaListBufs) },
         .{ .name = "nvim_list_wins", .f = @ptrCast(&luaListWins) },
+        .{ .name = "nvim_list_tabpages", .f = @ptrCast(&luaListTabpages) },
+        .{ .name = "nvim_get_current_tabpage", .f = @ptrCast(&luaGetCurrentTabpage) },
+        .{ .name = "nvim_tabpage_get_number", .f = @ptrCast(&luaTabpageGetNumber) },
+        .{ .name = "nvim_tabpage_get_win", .f = @ptrCast(&luaTabpageGetWin) },
+        .{ .name = "nvim_tabpage_is_valid", .f = @ptrCast(&luaTabpageIsValid) },
+        .{ .name = "nvim_get_current_line", .f = @ptrCast(&luaGetCurrentLine) },
+        .{ .name = "nvim_set_current_line", .f = @ptrCast(&luaSetCurrentLine) },
+        .{ .name = "nvim_del_current_line", .f = @ptrCast(&luaDelCurrentLine) },
+        .{ .name = "nvim_get_mode", .f = @ptrCast(&luaGetMode) },
         .{ .name = "nvim_create_augroup", .f = @ptrCast(&luaCreateAugroup) },
         .{ .name = "nvim_create_autocmd", .f = @ptrCast(&luaCreateAutocmd) },
         .{ .name = "nvim_exec_autocmds", .f = @ptrCast(&luaExecAutocmds) },
@@ -327,10 +505,19 @@ fn luaCreateBuf(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn resolveBufId(id: i64) u32 {
+    return if (id == 0) g_current_buf else @intCast(id);
+}
+
+fn resolveWinId(id: i64) u32 {
+    return if (id == 0) g_current_win else @intCast(id);
+}
+
 fn luaBufIsValid(L: ?*c.lua_State) callconv(.c) c_int {
     const LS: *c.lua_State = @ptrCast(L.?);
     const id = c.luaL_checkinteger(LS, 1);
-    if (g_store) |*s| c.lua_pushboolean(LS, if (s.isValid(@intCast(id))) 1 else 0) else c.lua_pushboolean(LS, if (id > 0) 1 else 0);
+    const resolved = resolveBufId(id);
+    if (g_store) |*s| c.lua_pushboolean(LS, if (s.isValid(resolved)) 1 else 0) else c.lua_pushboolean(LS, if (resolved > 0) 1 else 0);
     return 1;
 }
 
@@ -365,7 +552,7 @@ fn luaBufSetLines(L: ?*c.lua_State) callconv(.c) c_int {
     }
 
     if (g_store) |*s| {
-        s.setLines(@intCast(id), start, end, repl.items) catch {
+        s.setLines(resolveBufId(id), start, end, repl.items) catch {
             _ = c.luaL_error(LS, "invalid buffer");
             return 0;
         };
@@ -382,7 +569,7 @@ fn luaBufGetLines(L: ?*c.lua_State) callconv(.c) c_int {
 
     c.lua_newtable(LS);
     if (g_store) |*s| {
-        const lines = s.getLines(@intCast(id), start, end) catch &[_][]u8{};
+        const lines = s.getLines(resolveBufId(id), start, end) catch &[_][]u8{};
         for (lines, 0..) |line, i| {
             c.lua_pushlstring(LS, line.ptr, line.len);
             c.lua_rawseti(LS, -2, @as(c_int, @intCast(i + 1)));
@@ -394,14 +581,14 @@ fn luaBufGetLines(L: ?*c.lua_State) callconv(.c) c_int {
 fn luaBufLineCount(L: ?*c.lua_State) callconv(.c) c_int {
     const LS: *c.lua_State = @ptrCast(L.?);
     const id = c.luaL_checkinteger(LS, 1);
-    if (g_store) |*s| c.lua_pushinteger(LS, @as(c.lua_Integer, @intCast(s.lineCount(@intCast(id))))) else c.lua_pushinteger(LS, 0);
+    if (g_store) |*s| c.lua_pushinteger(LS, @as(c.lua_Integer, @intCast(s.lineCount(resolveBufId(id))))) else c.lua_pushinteger(LS, 0);
     return 1;
 }
 
 fn luaBufDelete(L: ?*c.lua_State) callconv(.c) c_int {
     const LS: *c.lua_State = @ptrCast(L.?);
     const id = c.luaL_checkinteger(LS, 1);
-    if (g_store) |*s| s.delete(@intCast(id));
+    if (g_store) |*s| s.delete(resolveBufId(id));
     return 0;
 }
 
@@ -409,6 +596,54 @@ fn luaGetCurrentBuf(L: ?*c.lua_State) callconv(.c) c_int {
     const LS: *c.lua_State = @ptrCast(L.?);
     c.lua_pushinteger(LS, @as(c.lua_Integer, @intCast(g_current_buf)));
     return 1;
+}
+
+fn luaBufGetName(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const id = c.luaL_checkinteger(LS, 1);
+    var name: []const u8 = "";
+    if (g_store) |*s| name = s.getName(resolveBufId(id));
+    c.lua_pushlstring(LS, name.ptr, name.len);
+    return 1;
+}
+
+fn luaBufSetName(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const id = c.luaL_checkinteger(LS, 1);
+    var len: usize = 0;
+    const name = c.luaL_checklstring(LS, 2, &len);
+    if (g_store) |*s| {
+        s.setName(resolveBufId(id), name[0..len]) catch {
+            _ = c.luaL_error(LS, "invalid buffer");
+            return 0;
+        };
+    }
+    return 0;
+}
+
+fn luaBufGetShortName(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const id = c.luaL_checkinteger(LS, 1);
+    var name: []const u8 = "";
+    if (g_store) |*s| name = s.getShortName(resolveBufId(id));
+    c.lua_pushlstring(LS, name.ptr, name.len);
+    return 1;
+}
+
+fn luaBufGetModified(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const id = c.luaL_checkinteger(LS, 1);
+    const modified = if (g_store) |*s| s.getModified(resolveBufId(id)) else false;
+    c.lua_pushboolean(LS, if (modified) 1 else 0);
+    return 1;
+}
+
+fn luaBufSetModified(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const id = c.luaL_checkinteger(LS, 1);
+    const value = c.lua_toboolean(LS, 2) != 0;
+    if (g_store) |*s| s.setModified(resolveBufId(id), value);
+    return 0;
 }
 
 fn luaSetCurrentBuf(L: ?*c.lua_State) callconv(.c) c_int {
@@ -422,7 +657,188 @@ fn luaSetCurrentBuf(L: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaGetCurrentWin(L: ?*c.lua_State) callconv(.c) c_int {
     const LS: *c.lua_State = @ptrCast(L.?);
-    c.lua_pushinteger(LS, 1000);
+    c.lua_pushinteger(LS, @as(c.lua_Integer, @intCast(g_current_win)));
+    return 1;
+}
+
+fn luaSetCurrentWin(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const id = c.luaL_checkinteger(LS, 1);
+    if (resolveWinId(id) == 1000) g_current_win = 1000;
+    return 0;
+}
+
+fn luaWinGetBuf(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    _ = c.luaL_checkinteger(LS, 1);
+    c.lua_pushinteger(LS, @as(c.lua_Integer, @intCast(g_win_buf)));
+    return 1;
+}
+
+fn luaWinSetBuf(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    _ = c.luaL_checkinteger(LS, 1);
+    const buf = c.luaL_checkinteger(LS, 2);
+    if (g_store) |*s| {
+        if (s.isValid(resolveBufId(buf))) {
+            g_win_buf = resolveBufId(buf);
+            g_current_buf = g_win_buf;
+        }
+    }
+    return 0;
+}
+
+fn luaWinGetCursor(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    _ = c.luaL_checkinteger(LS, 1);
+    c.lua_newtable(LS);
+    c.lua_pushinteger(LS, @intCast(g_cursor_row));
+    c.lua_rawseti(LS, -2, 1);
+    c.lua_pushinteger(LS, @intCast(g_cursor_col));
+    c.lua_rawseti(LS, -2, 2);
+    return 1;
+}
+
+fn luaWinSetCursor(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    _ = c.luaL_checkinteger(LS, 1);
+    _ = c.luaL_checktype(LS, 2, c.LUA_TTABLE);
+    c.lua_rawgeti(LS, 2, 1);
+    var row = c.luaL_checkinteger(LS, -1);
+    c.lua_pop(LS, 1);
+    c.lua_rawgeti(LS, 2, 2);
+    var col = c.luaL_checkinteger(LS, -1);
+    c.lua_pop(LS, 1);
+
+    const line_count: i64 = if (g_store) |*s| @intCast(s.lineCount(g_current_buf)) else 1;
+    if (row < 1) row = 1;
+    if (row > line_count) row = line_count;
+    if (col < 0) col = 0;
+    if (g_store) |*s| {
+        const lines = s.getLines(g_current_buf, row - 1, row) catch &[_][]u8{};
+        if (lines.len > 0 and col > @as(i64, @intCast(lines[0].len))) col = @intCast(lines[0].len);
+    }
+    g_cursor_row = row;
+    g_cursor_col = col;
+    return 0;
+}
+
+fn luaWinGetHeight(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    _ = c.luaL_checkinteger(LS, 1);
+    c.lua_pushinteger(LS, 22);
+    return 1;
+}
+
+fn luaWinGetWidth(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    _ = c.luaL_checkinteger(LS, 1);
+    c.lua_pushinteger(LS, 80);
+    return 1;
+}
+
+fn luaWinGetPosition(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    _ = c.luaL_checkinteger(LS, 1);
+    c.lua_newtable(LS);
+    c.lua_pushinteger(LS, 0);
+    c.lua_rawseti(LS, -2, 1);
+    c.lua_pushinteger(LS, 0);
+    c.lua_rawseti(LS, -2, 2);
+    return 1;
+}
+
+fn luaWinGetNumber(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    _ = c.luaL_checkinteger(LS, 1);
+    c.lua_pushinteger(LS, 1);
+    return 1;
+}
+
+fn luaWinIsValid(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const id = c.luaL_checkinteger(LS, 1);
+    c.lua_pushboolean(LS, if (resolveWinId(id) == 1000) 1 else 0);
+    return 1;
+}
+
+fn luaListTabpages(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    c.lua_newtable(LS);
+    c.lua_pushinteger(LS, @as(c.lua_Integer, @intCast(g_current_tab)));
+    c.lua_rawseti(LS, -2, 1);
+    return 1;
+}
+
+fn luaGetCurrentTabpage(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    c.lua_pushinteger(LS, @as(c.lua_Integer, @intCast(g_current_tab)));
+    return 1;
+}
+
+fn luaTabpageGetNumber(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    _ = c.luaL_checkinteger(LS, 1);
+    c.lua_pushinteger(LS, 1);
+    return 1;
+}
+
+fn luaTabpageGetWin(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    _ = c.luaL_checkinteger(LS, 1);
+    c.lua_pushinteger(LS, @as(c.lua_Integer, @intCast(g_current_win)));
+    return 1;
+}
+
+fn luaTabpageIsValid(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const id = c.luaL_checkinteger(LS, 1);
+    c.lua_pushboolean(LS, if (id == 0 or id == @as(c.lua_Integer, @intCast(g_current_tab))) 1 else 0);
+    return 1;
+}
+
+fn luaGetCurrentLine(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    var line: []const u8 = "";
+    if (g_store) |*s| {
+        const lines = s.getLines(g_current_buf, g_cursor_row - 1, g_cursor_row) catch &[_][]u8{};
+        if (lines.len > 0) line = lines[0];
+    }
+    c.lua_pushlstring(LS, line.ptr, line.len);
+    return 1;
+}
+
+fn luaSetCurrentLine(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    var len: usize = 0;
+    const line = c.luaL_checklstring(LS, 1, &len);
+    if (g_store) |*s| {
+        const replacement = [_][]const u8{line[0..len]};
+        s.setLines(g_current_buf, g_cursor_row - 1, g_cursor_row, &replacement) catch {};
+    }
+    return 0;
+}
+
+fn luaDelCurrentLine(L: ?*c.lua_State) callconv(.c) c_int {
+    _ = L;
+    if (g_store) |*s| {
+        if (s.lineCount(g_current_buf) > 1) {
+            s.setLines(g_current_buf, g_cursor_row - 1, g_cursor_row, &[_][]const u8{}) catch {};
+        } else {
+            const replacement = [_][]const u8{""};
+            s.setLines(g_current_buf, 0, 1, &replacement) catch {};
+        }
+    }
+    return 0;
+}
+
+fn luaGetMode(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    c.lua_newtable(LS);
+    c.lua_pushstring(LS, "n");
+    c.lua_setfield(LS, -2, "mode");
+    c.lua_pushboolean(LS, 0);
+    c.lua_setfield(LS, -2, "blocking");
     return 1;
 }
 
@@ -446,7 +862,7 @@ fn luaListBufs(L: ?*c.lua_State) callconv(.c) c_int {
 fn luaListWins(L: ?*c.lua_State) callconv(.c) c_int {
     const LS: *c.lua_State = @ptrCast(L.?);
     c.lua_newtable(LS);
-    c.lua_pushinteger(LS, 1000);
+    c.lua_pushinteger(LS, @as(c.lua_Integer, @intCast(g_current_win)));
     c.lua_rawseti(LS, -2, 1);
     return 1;
 }
@@ -482,6 +898,13 @@ fn luaSchedule(L: ?*c.lua_State) callconv(.c) c_int {
 fn getLoop() *c.uv_loop_t {
     if (g_loop == null) g_loop = c.uv_default_loop();
     return g_loop.?;
+}
+
+fn initCwd() void {
+    var size: usize = g_cwd_buf.len;
+    if (c.uv_cwd(&g_cwd_buf, &size) != 0) return;
+    const len = std.mem.indexOfScalar(u8, &g_cwd_buf, 0) orelse g_cwd_buf.len;
+    g_cwd = g_cwd_buf[0..len];
 }
 
 fn luaDeferFn(L: ?*c.lua_State) callconv(.c) c_int {
