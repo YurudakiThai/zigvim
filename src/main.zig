@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c");
 const msgpack = @import("msgpack.zig");
 
@@ -107,34 +108,32 @@ const BufferStore = struct {
         return "";
     }
 
-    /// Resolve a buffer name the way Neovim does: relative names become
-    /// absolute paths rooted at the process working directory, and existing
-    /// path components are canonicalised (e.g. /tmp -> /private/tmp).
+    /// Resolve a buffer name the way Neovim does for nvim_buf_get_name():
+    /// make it absolute and canonicalise existing path components (macOS
+    /// resolves /tmp to /private/tmp). The name as typed is kept separately
+    /// and exposed through vim.fn.expand('%').
     pub fn absoluteName(self: *BufferStore, name: []const u8) ![]u8 {
         if (name.len == 0) return self.allocator.dupe(u8, "");
         const full = if (name[0] == '/')
             try self.allocator.dupe(u8, name)
         else
             try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ g_cwd, name });
+        defer self.allocator.free(full);
 
         if (g_io) |io| {
             if (std.Io.Dir.cwd().realPathFileAlloc(io, full, self.allocator)) |real| {
-                const copy = try self.allocator.dupe(u8, real);
-                self.allocator.free(real);
-                self.allocator.free(full);
-                return copy;
+                defer self.allocator.free(real);
+                return self.allocator.dupe(u8, real);
             } else |_| {}
 
             if (std.fs.path.dirname(full)) |dir| {
                 if (std.Io.Dir.cwd().realPathFileAlloc(io, dir, self.allocator)) |real_dir| {
                     defer self.allocator.free(real_dir);
-                    const joined = try std.fs.path.join(self.allocator, &.{ real_dir, std.fs.path.basename(full) });
-                    self.allocator.free(full);
-                    return joined;
+                    return std.fs.path.join(self.allocator, &.{ real_dir, std.fs.path.basename(full) });
                 } else |_| {}
             }
         }
-        return full;
+        return std.fs.path.resolveAlloc(self.allocator, &.{full});
     }
 
     pub fn getLines(self: *BufferStore, id: u32, start: i64, end: i64) ![][]u8 {
@@ -215,6 +214,7 @@ pub fn main(init: std.process.Init) !void {
     defer cmds.deinit(gpa);
     var file_arg: ?[]const u8 = null;
     var clean = false;
+    var headless = false;
     var init_file: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -247,7 +247,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--clean")) {
             clean = true;
         } else if (std.mem.eql(u8, arg, "--headless") or std.mem.eql(u8, arg, "-es")) {
-            // Accepted for Neovim CLI compatibility; zigvim is API-first.
+            // Never start the terminal UI (Neovim CLI compatibility).
+            headless = true;
         } else if (std.mem.eql(u8, arg, "-u")) {
             i += 1;
             if (i >= args.items.len) {
@@ -281,6 +282,7 @@ pub fn main(init: std.process.Init) !void {
     g_L = L;
     try registerVimGlobal(L);
     try loadPrelude(L);
+    try loadTui(L);
 
     if (embed_mode) {
         try runRpcServer(init.io, L);
@@ -309,19 +311,57 @@ pub fn main(init: std.process.Init) !void {
             defer gpa.free(cmd);
             _ = execVimCommand(L, cmd);
         }
+    } else if (!headless and isInteractive()) {
+        // Plain `zigvim`: empty buffer in the terminal UI.
+        if (!clean) _ = loadUserConfig(L, init_file);
     } else {
         std.debug.print("Usage: zigvim <file> [-c <cmd>...] | zigvim -l <script.lua> [-c <cmd>...] | zigvim --embed\n", .{});
         std.process.exit(1);
     }
 
+    var quit_requested = false;
     for (cmds.items) |cmd| {
         _ = execVimCommand(L, cmd);
+        const t = std.mem.trim(u8, cmd, " \t:");
+        if (std.mem.eql(u8, t, "q") or std.mem.eql(u8, t, "q!") or std.mem.eql(u8, t, "qa") or
+            std.mem.eql(u8, t, "qa!") or std.mem.eql(u8, t, "qall") or std.mem.eql(u8, t, "wq") or
+            std.mem.eql(u8, t, "x") or std.mem.eql(u8, t, "wqa")) quit_requested = true;
+    }
+
+    if (lua_script == null and !headless and !quit_requested and isInteractive()) {
+        runTui(L);
     }
 
     pumpEventLoop(L);
     // Give libuv a chance to finish one-shot deferred callbacks.
     const loop = getLoop();
     _ = c.uv_run(loop, c.UV_RUN_NOWAIT);
+}
+
+fn isInteractive() bool {
+    return c.isatty(0) != 0 and c.isatty(1) != 0;
+}
+
+fn loadTui(L: *c.lua_State) !void {
+    const src = @embedFile("tui.lua");
+    const z = try g_allocator.dupeSentinel(u8, src, 0);
+    defer g_allocator.free(z);
+    if (c.luaL_dostring(L, z.ptr)) {
+        const err = c.lua_tolstring(L, -1, null);
+        if (err != null) std.debug.print("tui error: {s}\n", .{std.mem.span(err)});
+        return error.TuiFailed;
+    }
+}
+
+fn runTui(L: *c.lua_State) void {
+    c.lua_getglobal(L, "vim");
+    c.lua_getfield(L, -1, "_tui_run");
+    if (c.lua_pcall(L, 0, 0, 0) != 0) {
+        const err = c.lua_tolstring(L, -1, null);
+        if (err != null) std.debug.print("{s}\n", .{std.mem.span(err)});
+        c.lua_pop(L, 1);
+    }
+    c.lua_pop(L, 1);
 }
 
 fn execVimCommand(L: *c.lua_State, cmd: []const u8) bool {
@@ -407,6 +447,16 @@ fn registerVimGlobal(L: *c.lua_State) !void {
     c.lua_setfield(L, -2, "_buf_modified");
     c.lua_pushcfunction(L, luaBufSetModified);
     c.lua_setfield(L, -2, "_buf_set_modified");
+    c.lua_pushcfunction(L, luaTtyIsatty);
+    c.lua_setfield(L, -2, "_tty_isatty");
+    c.lua_pushcfunction(L, luaTtyRaw);
+    c.lua_setfield(L, -2, "_tty_raw");
+    c.lua_pushcfunction(L, luaTtySize);
+    c.lua_setfield(L, -2, "_tty_size");
+    c.lua_pushcfunction(L, luaTtyRead);
+    c.lua_setfield(L, -2, "_tty_read");
+    c.lua_pushcfunction(L, luaTtyWrite);
+    c.lua_setfield(L, -2, "_tty_write");
 
     c.lua_newtable(L);
     c.lua_pushcfunction(L, luaUvNewTimer);
@@ -421,6 +471,8 @@ fn registerVimGlobal(L: *c.lua_State) !void {
     c.lua_setfield(L, -2, "cwd");
     c.lua_pushcfunction(L, luaUvOsHomedir);
     c.lua_setfield(L, -2, "os_homedir");
+    c.lua_pushcfunction(L, luaUvExepath);
+    c.lua_setfield(L, -2, "exepath");
     c.lua_pushcfunction(L, luaUvOsGetenv);
     c.lua_setfield(L, -2, "os_getenv");
     c.lua_pushcfunction(L, luaUvOsSetenv);
@@ -516,6 +568,98 @@ fn regApi(L: *c.lua_State) void {
         c.lua_pushcfunction(L, p.f);
         c.lua_setfield(L, -2, p.name);
     }
+}
+
+// ------------------------------------------------------------ terminal I/O
+// Raw terminal primitives for the Lua TUI (src/tui.lua).
+
+var g_orig_termios: c.struct_termios = undefined;
+var g_raw_enabled: bool = false;
+
+fn luaTtyIsatty(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    c.lua_pushboolean(LS, if (c.isatty(0) != 0 and c.isatty(1) != 0) 1 else 0);
+    return 1;
+}
+
+fn luaTtyRaw(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const enable = c.lua_toboolean(LS, 1) != 0;
+    if (enable and !g_raw_enabled) {
+        if (c.tcgetattr(0, &g_orig_termios) != 0) {
+            c.lua_pushboolean(LS, 0);
+            return 1;
+        }
+        var raw = g_orig_termios;
+        raw.c_iflag &= ~@as(c.tcflag_t, c.IGNBRK | c.BRKINT | c.PARMRK | c.ISTRIP | c.INLCR | c.IGNCR | c.ICRNL | c.IXON);
+        raw.c_oflag &= ~@as(c.tcflag_t, c.OPOST);
+        raw.c_lflag &= ~@as(c.tcflag_t, c.ECHO | c.ECHONL | c.ICANON | c.ISIG | c.IEXTEN);
+        raw.c_cflag |= @as(c.tcflag_t, c.CS8);
+        raw.c_cc[c.VMIN] = 1;
+        raw.c_cc[c.VTIME] = 0;
+        if (c.tcsetattr(0, c.TCSAFLUSH, &raw) != 0) {
+            c.lua_pushboolean(LS, 0);
+            return 1;
+        }
+        g_raw_enabled = true;
+    } else if (!enable and g_raw_enabled) {
+        _ = c.tcsetattr(0, c.TCSAFLUSH, &g_orig_termios);
+        g_raw_enabled = false;
+    }
+    c.lua_pushboolean(LS, 1);
+    return 1;
+}
+
+fn luaTtySize(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    var ws: c.struct_winsize = std.mem.zeroes(c.struct_winsize);
+    const req: c_ulong = if (builtin.os.tag == .macos) 0x40087468 else 0x5413;
+    var rows: c_int = 24;
+    var cols: c_int = 80;
+    if (c.ioctl(1, req, &ws) == 0 and ws.ws_col > 0 and ws.ws_row > 0) {
+        rows = ws.ws_row;
+        cols = ws.ws_col;
+    }
+    c.lua_pushinteger(LS, rows);
+    c.lua_pushinteger(LS, cols);
+    return 2;
+}
+
+/// Wait up to `timeout` ms for input. Returns "" on timeout, nil on EOF.
+fn luaTtyRead(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const timeout: c_int = @intCast(c.luaL_optinteger(LS, 1, 100));
+    var pfd = c.struct_pollfd{ .fd = 0, .events = c.POLLIN, .revents = 0 };
+    const ready = c.poll(&pfd, 1, timeout);
+    if (ready <= 0) {
+        c.lua_pushstring(LS, "");
+        return 1;
+    }
+    var buf: [1024]u8 = undefined;
+    const n = c.read(0, &buf, buf.len);
+    if (n == 0) {
+        c.lua_pushnil(LS);
+        return 1;
+    }
+    if (n < 0) {
+        c.lua_pushstring(LS, "");
+        return 1;
+    }
+    c.lua_pushlstring(LS, &buf, @intCast(n));
+    return 1;
+}
+
+fn luaTtyWrite(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    var len: usize = 0;
+    const data = c.luaL_checklstring(LS, 1, &len);
+    var off: usize = 0;
+    while (off < len) {
+        const n = c.write(1, data + off, len - off);
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+    return 0;
 }
 
 fn luaHas(L: ?*c.lua_State) callconv(.c) c_int {
@@ -1234,6 +1378,18 @@ fn luaUvOsHomedir(L: ?*c.lua_State) callconv(.c) c_int {
     }
     const len = std.mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
     c.lua_pushlstring(LS, &buf, len);
+    return 1;
+}
+
+fn luaUvExepath(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    var buf: [4096]u8 = undefined;
+    var size: usize = buf.len;
+    if (c.uv_exepath(&buf, &size) != 0) {
+        c.lua_pushnil(LS);
+        return 1;
+    }
+    c.lua_pushlstring(LS, &buf, size);
     return 1;
 }
 

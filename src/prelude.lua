@@ -2,7 +2,24 @@
 -- Loaded once after the C-level `vim` table is registered, before user code.
 
 -- Make Neovim's shipped runtime modules available (vim.inspect, vim.iter, ...).
-package.path = "runtime/lua/?.lua;runtime/lua/?/init.lua;" .. package.path
+-- ZIGVIM_RUNTIME overrides the location (default: ./runtime, i.e. run zigvim
+-- from the project root or point the variable at <project>/runtime).
+local runtime_dir = os.getenv('ZIGVIM_RUNTIME')
+if runtime_dir == nil or runtime_dir == '' then
+  runtime_dir = 'runtime'
+  -- Prefer <project>/runtime next to the binary (<project>/zig-out/bin/zigvim)
+  -- so zigvim works from any working directory.
+  local exe = vim.uv.exepath and vim.uv.exepath()
+  local root = exe and exe:match('^(.*)/zig%-out/bin/[^/]+$')
+  if root then
+    local probe = io.open(root .. '/runtime/lua/vim/inspect.lua', 'r')
+    if probe then
+      probe:close()
+      runtime_dir = root .. '/runtime'
+    end
+  end
+end
+package.path = runtime_dir .. '/lua/?.lua;' .. runtime_dir .. '/lua/?/init.lua;' .. package.path
 
 -- Neovim raises API errors without a Lua source position prefix (the message
 -- comes from the C API layer). Use level 0 so pcall() sees the same text.
@@ -53,10 +70,14 @@ local function json_escape(s)
   end))
 end
 
+vim._empty_dict_mt = vim._empty_dict_mt or {}
+vim.empty_dict = function()
+  return setmetatable({}, vim._empty_dict_mt)
+end
+
 local function is_array(t)
   local n = #t
   if n == 0 then
-    -- Empty tables encode as objects, matching Neovim's vim.json behaviour.
     return false
   end
   local count = 0
@@ -95,6 +116,9 @@ function encode_value(v)
   elseif t == 'string' then
     return '"' .. json_escape(v) .. '"'
   elseif t == 'table' then
+    if vim._empty_dict_mt and getmetatable(v) == vim._empty_dict_mt then
+      return '{}'
+    end
     local parts = {}
     if is_array(v) then
       for i = 1, #v do
@@ -384,9 +408,52 @@ local option_defaults = {
   termguicolors = false,
   mouse = '',
   clipboard = '',
+  loadplugins = true,
 }
 
-local option_store = {}
+-- Short names (sw, rnu, ...) resolve to their long option through the
+-- metatable, so every table keyed by option name accepts both spellings.
+local option_aliases = {}
+local function alias_table(t)
+  return setmetatable(t, {
+    __index = function(tbl, k)
+      local long = option_aliases[k]
+      if long then
+        return rawget(tbl, long)
+      end
+    end,
+    __newindex = function(tbl, k, v)
+      rawset(tbl, option_aliases[k] or k, v)
+    end,
+  })
+end
+
+alias_table(option_defaults)
+local option_store = alias_table({})
+
+-- Neovim's generated option metadata lists every option with its default and
+-- short name, so use it instead of keeping a hand-written subset.
+do
+  local f = io.open(runtime_dir .. '/lua/vim/_meta/options.gen.lua', 'r')
+  if f then
+    local text = f:read('*a') or ''
+    f:close()
+    for name, rhs in text:gmatch('\nvim%.o%.([%w_]+) = ([^\n]+)') do
+      local target = rhs:match('^vim%.o%.([%w_]+)$')
+      if target then
+        option_aliases[name] = target
+      elseif rawget(option_defaults, name) == nil then
+        local chunk = loadstring('return ' .. rhs)
+        if chunk then
+          local ok, value = pcall(chunk)
+          if ok and value ~= nil then
+            rawset(option_defaults, name, value)
+          end
+        end
+      end
+    end
+  end
+end
 
 local function check_option(name)
   if name == nil or option_defaults[name] == nil then
@@ -415,8 +482,276 @@ local option_mt = {
   end,
 }
 
-vim.o = setmetatable({}, option_mt)
-vim.opt = setmetatable({}, option_mt)
+-- ------------------------------------------------- list options (rtp, pp)
+-- 'runtimepath' and 'packpath' are comma lists that plugin managers mutate
+-- with vim.opt.rtp:prepend()/append()/remove(). `require` resolves Lua
+-- modules through 'runtimepath' (<dir>/lua/<name>.lua), like Neovim does.
+local list_option_aliases = {
+  runtimepath = 'runtimepath',
+  rtp = 'runtimepath',
+  packpath = 'packpath',
+  pp = 'packpath',
+}
+local list_option_store = {}
+
+local function runtime_root()
+  if runtime_dir:sub(1, 1) == '/' then
+    return runtime_dir
+  end
+  return (vim.uv.cwd() or '.') .. '/' .. runtime_dir
+end
+
+local function list_get(name)
+  local list = list_option_store[name]
+  if not list then
+    local config = vim.fn.stdpath('config')
+    local data = vim.fn.stdpath('data')
+    if name == 'runtimepath' then
+      list = { config, data .. '/site', runtime_root(), data .. '/site/after', config .. '/after' }
+    else
+      list = { data .. '/site' }
+    end
+    list_option_store[name] = list
+  end
+  return list
+end
+
+local function to_list(value)
+  local out = {}
+  if type(value) == 'table' then
+    for _, item in ipairs(value) do
+      out[#out + 1] = tostring(item)
+    end
+  elseif value ~= nil then
+    for part in tostring(value):gmatch('[^,]+') do
+      out[#out + 1] = part
+    end
+  end
+  return out
+end
+
+local function list_set(name, value)
+  list_option_store[name] = to_list(value)
+end
+
+local function list_remove_items(list, items)
+  local drop = {}
+  for _, item in ipairs(items) do
+    drop[item] = true
+  end
+  local kept = {}
+  for _, entry in ipairs(list) do
+    if not drop[entry] then
+      kept[#kept + 1] = entry
+    end
+  end
+  return kept
+end
+
+local ListOption = {}
+ListOption.__index = ListOption
+
+function ListOption:get()
+  return to_list(list_get(self._name))
+end
+
+function ListOption:append(value)
+  local items = to_list(value)
+  local list = list_remove_items(list_get(self._name), items)
+  for _, item in ipairs(items) do
+    list[#list + 1] = item
+  end
+  list_option_store[self._name] = list
+  return self
+end
+
+function ListOption:prepend(value)
+  local items = to_list(value)
+  local list = list_remove_items(list_get(self._name), items)
+  for i = #items, 1, -1 do
+    table.insert(list, 1, items[i])
+  end
+  list_option_store[self._name] = list
+  return self
+end
+
+function ListOption:remove(value)
+  list_option_store[self._name] = list_remove_items(list_get(self._name), to_list(value))
+  return self
+end
+
+ListOption.__tostring = function(self)
+  return table.concat(list_get(self._name), ',')
+end
+
+-- Options whose value is a string of single-character flags.
+local flag_options = {
+  shortmess = true,
+  formatoptions = true,
+  cpoptions = true,
+  guioptions = true,
+  mouse = true,
+}
+
+-- vim.opt accepts lists ({ 'a', 'b' }) and maps ({ tab = '> ' }) for
+-- comma-separated string options; flatten them to the string form.
+local function opt_to_string(name, value)
+  if type(value) ~= 'table' then
+    return value
+  end
+  local parts = {}
+  if #value > 0 then
+    for _, item in ipairs(value) do
+      parts[#parts + 1] = tostring(item)
+    end
+    return table.concat(parts, flag_options[name] and '' or ',')
+  end
+  local keys = {}
+  for key in pairs(value) do
+    keys[#keys + 1] = key
+  end
+  table.sort(keys)
+  for _, key in ipairs(keys) do
+    local item = value[key]
+    if item == true then
+      parts[#parts + 1] = key
+    elseif item ~= false and item ~= nil then
+      parts[#parts + 1] = key .. ':' .. tostring(item)
+    end
+  end
+  return table.concat(parts, flag_options[name] and '' or ',')
+end
+
+local StringOption = {}
+StringOption.__index = StringOption
+
+local function string_option_raw(name)
+  return option_mt.__index(nil, name)
+end
+
+function StringOption:get()
+  local value = string_option_raw(self._name)
+  local out = {}
+  if flag_options[self._name] then
+    for ch in value:gmatch('.') do
+      out[ch] = true
+    end
+    return out
+  end
+  for part in value:gmatch('[^,]+') do
+    out[#out + 1] = part
+  end
+  return out
+end
+
+local function string_items(name, value)
+  local text = opt_to_string(name, value)
+  local items = {}
+  if flag_options[name] then
+    for ch in tostring(text):gmatch('.') do
+      items[#items + 1] = ch
+    end
+  else
+    for part in tostring(text):gmatch('[^,]+') do
+      items[#items + 1] = part
+    end
+  end
+  return items
+end
+
+local function string_join(name, items)
+  return table.concat(items, flag_options[name] and '' or ',')
+end
+
+function StringOption:append(value)
+  local name = self._name
+  local items = string_items(name, string_option_raw(name))
+  local seen = {}
+  for _, item in ipairs(items) do
+    seen[item] = true
+  end
+  for _, item in ipairs(string_items(name, value)) do
+    if not seen[item] then
+      items[#items + 1] = item
+    end
+  end
+  option_mt.__newindex(nil, name, string_join(name, items))
+  return self
+end
+
+function StringOption:prepend(value)
+  local name = self._name
+  local added = string_items(name, value)
+  local drop = {}
+  for _, item in ipairs(added) do
+    drop[item] = true
+  end
+  for _, item in ipairs(string_items(name, string_option_raw(name))) do
+    if not drop[item] then
+      added[#added + 1] = item
+    end
+  end
+  option_mt.__newindex(nil, name, string_join(name, added))
+  return self
+end
+
+function StringOption:remove(value)
+  local name = self._name
+  local drop = {}
+  for _, item in ipairs(string_items(name, value)) do
+    drop[item] = true
+    drop[item:match('^([^:]+):') or item] = true
+  end
+  local kept = {}
+  for _, item in ipairs(string_items(name, string_option_raw(name))) do
+    if not (drop[item] or drop[item:match('^([^:]+):') or item]) then
+      kept[#kept + 1] = item
+    end
+  end
+  option_mt.__newindex(nil, name, string_join(name, kept))
+  return self
+end
+
+StringOption.__tostring = function(self)
+  return tostring(string_option_raw(self._name))
+end
+
+local function opt_newindex(t, k, v)
+  local list = list_option_aliases[k]
+  if list then
+    list_set(list, v)
+    return
+  end
+  return option_mt.__newindex(t, k, opt_to_string(k, v))
+end
+
+vim.opt = setmetatable({}, {
+  __index = function(t, k)
+    local list = list_option_aliases[k]
+    if list then
+      return setmetatable({ _name = list }, ListOption)
+    end
+    local value = option_mt.__index(t, k)
+    if type(value) == 'string' then
+      return setmetatable({ _name = option_aliases[k] or k }, StringOption)
+    end
+    return value
+  end,
+  __newindex = opt_newindex,
+})
+
+vim.o = setmetatable({}, {
+  __index = function(t, k)
+    local list = list_option_aliases[k]
+    if list then
+      return table.concat(list_get(list), ',')
+    end
+    return option_mt.__index(t, k)
+  end,
+  __newindex = opt_newindex,
+})
+
+vim.go = vim.o
 vim.opt_local = vim.opt
 vim.opt_global = vim.opt
 
@@ -444,7 +779,7 @@ local function buf_opt_set(id, k, v)
   check_buf_option(k)
   local opts = buffer_options[id]
   if not opts then
-    opts = {}
+    opts = alias_table({})
     buffer_options[id] = opts
   end
   opts[k] = v
@@ -474,7 +809,7 @@ vim.bo = setmetatable({}, {
 })
 
 -- Window-local options (a single window for now).
-local window_options = {}
+local window_options = alias_table({})
 vim.wo = setmetatable({}, {
   __index = function(_, k)
     check_option(k)
@@ -680,16 +1015,26 @@ function vim.fn.expand(expr)
   if name == '' then
     name = vim.api.nvim_buf_get_name(0)
   end
-  if expr == '%' then
-    return name
-  elseif expr == '%:p' then
-    return vim.fn.fnamemodify(name, ':p')
-  elseif expr == '%:t' then
-    return basename(name)
-  elseif expr == '~' then
+  if expr == '~' then
     return home_dir()
   elseif expr:sub(1, 1) == '~' then
     return home_dir() .. expr:sub(2)
+  elseif expr:sub(1, 1) == '$' then
+    local env, rest = expr:match('^%$([%w_]+)(.*)$')
+    if env then
+      local value = os.getenv(env) or ''
+      return value .. rest
+    end
+    return ''
+  elseif expr:sub(1, 1) == '%' then
+    if name == '' then
+      return ''
+    end
+    local modifiers = expr:sub(2)
+    if modifiers == '' then
+      return name
+    end
+    return vim.fn.fnamemodify(name, modifiers)
   end
   return expr
 end
@@ -808,8 +1153,24 @@ function vim.fn.cursor(...)
   end
   local row = tonumber(args[1]) or vim.api.nvim_win_get_cursor(0)[1]
   local col = tonumber(args[2]) or 1
-  vim.api.nvim_win_set_cursor(0, { row, math.max(col - 1, 0) })
+  local lines = vim.api.nvim_buf_get_lines(0, row - 1, row, false)
+  local length = #(lines[1] or '')
+  if col > length then
+    col = math.max(length, 1)
+  end
+  if col < 1 then
+    col = 1
+  end
+  vim.api.nvim_win_set_cursor(0, { row, col - 1 })
   return 0
+end
+
+function vim.fn.strwidth(s)
+  return vim.api.nvim_strwidth(tostring(s))
+end
+
+function vim.fn.strlen(s)
+  return #tostring(s)
 end
 
 function vim.fn.filereadable(path)
@@ -827,13 +1188,6 @@ function vim.fn.getenv(name)
     return vim.NIL
   end
   return value
-end
-
-function vim.fn.exists(expr)
-  if expr == '*vim' or expr == 'g:zigvim' then
-    return 1
-  end
-  return 0
 end
 
 function vim.fn.getftype(path)
@@ -1013,6 +1367,61 @@ local function exec_cmd(cmd)
         vim.bo[option] = true
       end
     end
+  elseif name == 'source' or name == 'so' then
+    local path = rest
+    if path:sub(1, 1) == '~' then
+      path = home_dir() .. path:sub(2)
+    end
+    if path:sub(-4) == '.lua' then
+      local chunk, err = loadfile(path)
+      if not chunk then
+        error("E484: Can't open file " .. path .. (err and (': ' .. tostring(err)) or ''), 0)
+      end
+      chunk()
+    elseif vim.fn.filereadable(path) ~= 1 then
+      error("E484: Can't open file " .. path, 0)
+    end
+    -- Vimscript files are not supported yet and are skipped.
+  elseif name == 'augroup' or name == 'aug' or name == 'packadd' or name == 'filetype'
+    or name == 'syntax' or name == 'syn' or name == 'highlight' or name == 'hi'
+    or name == 'highlight!' or name == 'hi!' then
+    -- Accepted and ignored: no Vimscript engine / highlighter behind these yet.
+  elseif name == 'colorscheme' or name == 'colo' then
+    local scheme = rest
+    if scheme == '' then
+      return
+    end
+    fire_autocmd('ColorSchemePre', { pattern = scheme })
+    local found
+    for _, ext in ipairs({ 'lua', 'vim' }) do
+      found = vim.api.nvim_get_runtime_file('colors/' .. scheme .. '.' .. ext, false)[1]
+      if found then
+        if ext == 'lua' then
+          local chunk, err = loadfile(found)
+          if not chunk then
+            error(tostring(err), 0)
+          end
+          chunk()
+        end
+        break
+      end
+    end
+    if not found then
+      error('E185: Cannot find color scheme \'' .. scheme .. '\'', 0)
+    end
+    vim.g.colors_name = vim.g.colors_name or scheme
+    fire_autocmd('ColorScheme', { pattern = scheme })
+  elseif name == 'runtime' or name == 'ru' or name == 'runtime!' or name == 'ru!' then
+    for pattern in rest:gmatch('%S+') do
+      for _, file in ipairs(vim.api.nvim_get_runtime_file(pattern, name:sub(-1) == '!')) do
+        if file:sub(-4) == '.lua' then
+          local chunk = loadfile(file)
+          if chunk then
+            chunk()
+          end
+        end
+      end
+    end
   elseif name == 'lua' then
     local chunk, err = loadstring(rest)
     if not chunk then
@@ -1073,9 +1482,41 @@ local function exec_lines(cmd, wrap)
   end
 end
 
-function vim.cmd(cmd)
+local function cmd_call(cmd)
   exec_lines(cmd, true)
 end
+
+-- vim.cmd is both callable (vim.cmd('set x')) and indexable
+-- (vim.cmd.colorscheme('tokyonight'), vim.cmd.edit({ args = { 'f' }, bang = true })).
+vim.cmd = setmetatable({}, {
+  __call = function(_, cmd)
+    return cmd_call(cmd)
+  end,
+  __index = function(_, name)
+    return function(...)
+      local args = { ... }
+      local line = name
+      local parts = {}
+      local first = args[1]
+      if type(first) == 'table' then
+        if first.bang then
+          line = line .. '!'
+        end
+        for _, arg in ipairs(first.args or {}) do
+          parts[#parts + 1] = tostring(arg)
+        end
+      else
+        for _, arg in ipairs(args) do
+          parts[#parts + 1] = tostring(arg)
+        end
+      end
+      if #parts > 0 then
+        line = line .. ' ' .. table.concat(parts, ' ')
+      end
+      return cmd_call(line)
+    end
+  end,
+})
 
 local function exec_lua(code, args)
   local chunk, err = loadstring(code)
@@ -1165,6 +1606,278 @@ vim.api.nvim_buf_call = function(buf, fn)
   end
   return result
 end
+
+-- ------------------------------------------------- runtimepath + require
+-- Neovim's `require` also searches <runtimepath>/lua/. Without this a user
+-- config (~/.config/nvim/lua/config/lazy.lua) and plugins prepended to
+-- 'runtimepath' (lazy.nvim) can never be found.
+do
+  local function rtp_searcher(modname)
+    local rel = modname:gsub('%.', '/')
+    for _, dir in ipairs(list_get('runtimepath')) do
+      for _, candidate in ipairs({
+        dir .. '/lua/' .. rel .. '.lua',
+        dir .. '/lua/' .. rel .. '/init.lua',
+      }) do
+        local f = io.open(candidate, 'rb')
+        if f then
+          f:close()
+          local chunk, err = loadfile(candidate)
+          if not chunk then
+            error("error loading module '" .. modname .. "' from file '" .. candidate .. "':\n\t" .. tostring(err), 0)
+          end
+          return chunk
+        end
+      end
+    end
+    return "\n\tno file '" .. rel .. "' in runtimepath"
+  end
+  local searchers = package.loaders or package.searchers
+  table.insert(searchers, 2, rtp_searcher)
+end
+
+vim.api.nvim_list_runtime_paths = function()
+  return to_list(list_get('runtimepath'))
+end
+
+vim.api.nvim_get_runtime_file = function(name, all)
+  local found = {}
+  for _, dir in ipairs(list_get('runtimepath')) do
+    local pattern = dir .. '/' .. name
+    local matches
+    if pattern:find('[*?]') then
+      matches = vim.fn.glob(pattern, false, true)
+    elseif vim.uv.fs_stat(pattern) then
+      matches = { pattern }
+    else
+      matches = {}
+    end
+    for _, match in ipairs(matches) do
+      found[#found + 1] = match
+      if not all then
+        return found
+      end
+    end
+  end
+  return found
+end
+
+vim.api.nvim_echo = function(chunks, _history, opts)
+  local parts = {}
+  for _, chunk in ipairs(chunks or {}) do
+    parts[#parts + 1] = tostring(chunk[1])
+  end
+  local stream = (opts and opts.err) and io.stderr or io.stdout
+  stream:write(table.concat(parts) .. '\n')
+end
+
+function vim.fn.getchar()
+  return 27
+end
+
+function vim.in_fast_event()
+  return false
+end
+
+-- Completion candidates; only colorschemes are backed by real data so far.
+function vim.fn.getcompletion(pat, kind)
+  local out = {}
+  if kind == 'color' then
+    local seen = {}
+    for _, ext in ipairs({ 'lua', 'vim' }) do
+      for _, file in ipairs(vim.api.nvim_get_runtime_file('colors/*.' .. ext, true)) do
+        local name = file:match('([^/]+)%.' .. ext .. '$')
+        if name and not seen[name] then
+          seen[name] = true
+          out[#out + 1] = name
+        end
+      end
+    end
+    table.sort(out)
+  end
+  if pat ~= nil and pat ~= '' then
+    local filtered = {}
+    for _, item in ipairs(out) do
+      if item:sub(1, #pat) == pat then
+        filtered[#filtered + 1] = item
+      end
+    end
+    return filtered
+  end
+  return out
+end
+
+function vim.fn.executable(name)
+  name = tostring(name)
+  if name == '' then
+    return 0
+  end
+  local command
+  if name:find('/', 1, true) then
+    command = "test -x '" .. name:gsub("'", "'\\''") .. "' >/dev/null 2>&1"
+  else
+    command = "command -v '" .. name:gsub("'", "'\\''") .. "' >/dev/null 2>&1"
+  end
+  local ok = os.execute(command)
+  return (ok == true or ok == 0) and 1 or 0
+end
+
+function vim.fn.getscriptinfo()
+  return {}
+end
+
+vim.api.nvim_list_uis = function()
+  return {}
+end
+
+-- $VIMRUNTIME points at the runtime shipped with zigvim.
+if os.getenv('VIMRUNTIME') == nil then
+  vim.uv.os_setenv('VIMRUNTIME', runtime_root())
+end
+
+-- luv's fs_scandir() returns a handle consumed by fs_scandir_next(); the Zig
+-- core returns a plain list of names. Wrap it so both styles work.
+do
+  local list_scandir = vim.uv.fs_scandir
+  vim.uv._scandir_list = list_scandir
+  vim.uv.fs_scandir = function(path)
+    local names = list_scandir(path)
+    if not names then
+      return nil
+    end
+    return { path = path, names = names, index = 0 }
+  end
+  vim.uv.fs_scandir_next = function(handle)
+    handle.index = handle.index + 1
+    local name = handle.names[handle.index]
+    if not name then
+      return nil
+    end
+    local stat = vim.uv.fs_stat(handle.path .. '/' .. name)
+    return name, stat and stat.type or 'file'
+  end
+end
+
+vim.loop = vim.uv
+
+-- Handles that need a running libuv loop are inert for now.
+vim.uv.new_check = function()
+  local handle = {}
+  function handle.start()
+    return 0
+  end
+  function handle.stop()
+    return 0
+  end
+  function handle.close() end
+  function handle.is_active()
+    return false
+  end
+  return handle
+end
+vim.uv.fs_lstat = vim.uv.fs_stat
+vim.uv.available_parallelism = function()
+  return 4
+end
+
+-- File descriptors on top of io.* (enough for the module cache and lazy.nvim).
+vim.uv.fs_open = function(path, flags, _mode)
+  local mode = 'rb'
+  if type(flags) == 'string' then
+    if flags:find('a') then
+      mode = 'ab'
+    elseif flags:find('w') then
+      mode = 'wb'
+    end
+  end
+  local file = io.open(path, mode)
+  if not file then
+    return nil
+  end
+  return { _file = file }
+end
+vim.uv.fs_close = function(fd)
+  fd._file:close()
+  return true
+end
+vim.uv.fs_read = function(fd, size, offset)
+  if offset and offset >= 0 then
+    fd._file:seek('set', offset)
+  end
+  return fd._file:read(size) or ''
+end
+vim.uv.fs_write = function(fd, data, offset)
+  if offset and offset >= 0 then
+    fd._file:seek('set', offset)
+  end
+  fd._file:write(data)
+  return #data
+end
+vim.uv.fs_fstat = function(fd)
+  local current = fd._file:seek()
+  local size = fd._file:seek('end')
+  fd._file:seek('set', current)
+  return { size = size, type = 'file', mtime = { sec = 0, nsec = 0 } }
+end
+
+vim.api.nvim_replace_termcodes = function(str, _from_part, _do_lt, _special)
+  return str
+end
+
+-- Minimal vim.loader: Neovim's own implementation needs far more of the uv
+-- API than zigvim provides. Module lookup goes through the rtp searcher above,
+-- so enable()/disable() are no-ops; find() is used by lazy.nvim.
+vim.loader = {
+  enabled = false,
+  path = vim.fn.stdpath('cache') .. '/luac',
+  enable = function() end,
+  disable = function() end,
+  reset = function() end,
+  _profile = function() end,
+  _inspect = function()
+    return {}
+  end,
+  find = function(modname, opts)
+    opts = opts or {}
+    local results = {}
+    local dirs = {}
+    if opts.rtp ~= false then
+      for _, dir in ipairs(list_get('runtimepath')) do
+        dirs[#dirs + 1] = dir
+      end
+    end
+    for _, dir in ipairs(opts.paths or {}) do
+      dirs[#dirs + 1] = dir
+    end
+    modname = modname:gsub('/', '.')
+    if modname == '*' then
+      for _, dir in ipairs(dirs) do
+        for _, name in ipairs(vim.uv._scandir_list(dir .. '/lua') or {}) do
+          local top = name:match('^(.+)%.lua$') or (not name:find('.', 1, true) and name or nil)
+          if top then
+            results[#results + 1] = { modpath = dir .. '/lua/' .. name, modname = top }
+          end
+        end
+      end
+      return results
+    end
+    local basename = modname:gsub('%.', '/')
+    local patterns = opts.patterns or { '/init.lua', '.lua' }
+    for _, dir in ipairs(dirs) do
+      for _, pattern in ipairs(patterns) do
+        local path = dir .. '/lua/' .. basename .. pattern
+        local stat = vim.uv.fs_stat(path)
+        if stat then
+          results[#results + 1] = { modpath = path, modname = modname, stat = stat }
+          if not opts.all then
+            return results
+          end
+        end
+      end
+    end
+    return results
+  end,
+}
 
 -- Load the user's init.lua when running as an editor (not for -l scripts).
 function vim._load_init()
@@ -1366,6 +2079,9 @@ end
 -- ------------------------------------------------------------- options API
 local function option_value(name, opts)
   opts = opts or {}
+  if list_option_aliases[name] then
+    return table.concat(list_get(list_option_aliases[name]), ',')
+  end
   check_option(name)
   if opts.buf and opts.buf ~= 0 then
     return buf_opt_get(opts.buf, name)
@@ -1394,6 +2110,10 @@ end
 
 local function set_option_value(name, value, opts)
   opts = opts or {}
+  if list_option_aliases[name] then
+    list_set(list_option_aliases[name], value)
+    return
+  end
   check_option(name)
   if opts.buf and opts.buf ~= 0 then
     buf_opt_set(opts.buf, name, value)
@@ -1872,6 +2592,31 @@ do
     state.groups[name] = id
     state.group_names[id] = name
     return id
+  end
+
+  local function delete_group(id)
+    for autocmd_id, record in pairs(state.items) do
+      if record.group == id then
+        state.items[autocmd_id] = nil
+      end
+    end
+    local name = state.group_names[id]
+    if name then
+      state.groups[name] = nil
+      state.group_names[id] = nil
+    end
+  end
+
+  vim.api.nvim_del_augroup_by_name = function(name)
+    local id = state.groups[name]
+    if not id then
+      api_error('Invalid group: ' .. tostring(name))
+    end
+    delete_group(id)
+  end
+
+  vim.api.nvim_del_augroup_by_id = function(id)
+    delete_group(id)
   end
 
   vim.api.nvim_create_autocmd = function(events, opts)
@@ -2465,4 +3210,723 @@ do
   end
 
   vim.api.nvim_create_namespace = vim.api.nvim_create_namespace
+end
+
+-- ---------------------------------------------------- vim.fn editing helpers
+do
+  local registers = {}
+
+  local function current_lines()
+    return vim.api.nvim_buf_get_lines(0, 0, -1, false)
+  end
+
+  local function to_line_number(expr, bufline_count)
+    expr = tostring(expr)
+    if expr == '.' then
+      return vim.api.nvim_win_get_cursor(0)[1]
+    elseif expr == '$' then
+      return bufline_count
+    end
+    local num = tonumber(expr)
+    if num then
+      return num
+    end
+    return 0
+  end
+
+  function vim.fn.getline(expr, end_)
+    local lines = current_lines()
+    local first = to_line_number(expr, #lines)
+    if first < 1 then
+      return ''
+    end
+    local last = first
+    if end_ ~= nil then
+      last = to_line_number(end_, #lines)
+    end
+    if last < first then
+      return ''
+    end
+    if end_ == nil then
+      return lines[first] or ''
+    end
+    local out = {}
+    for lnum = first, math.min(last, #lines) do
+      out[#out + 1] = lines[lnum]
+    end
+    return out
+  end
+
+  function vim.fn.getbufline(buf, first, end_)
+    buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    first = to_line_number(first, #lines)
+    end_ = end_ == nil and first or to_line_number(end_, #lines)
+    if first < 1 or end_ < first then
+      return {}
+    end
+    local out = {}
+    for lnum = first, math.min(end_, #lines) do
+      out[#out + 1] = lines[lnum]
+    end
+    return out
+  end
+
+  function vim.fn.setline(lnum, text)
+    lnum = to_line_number(lnum, #current_lines())
+    if lnum < 1 then
+      return 1
+    end
+    local replacement = type(text) == 'table' and text or { tostring(text) }
+    vim.api.nvim_buf_set_lines(0, lnum - 1, lnum + #replacement - 1, false, replacement)
+    return 0
+  end
+
+  function vim.fn.append(lnum, text)
+    lnum = to_line_number(lnum, #current_lines())
+    local lines = type(text) == 'table' and text or { tostring(text) }
+    vim.api.nvim_buf_set_lines(0, math.max(lnum, 0), math.max(lnum, 0), false, lines)
+    return 0
+  end
+
+  function vim.fn.deletebufline(buf, first, end_)
+    buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+    local count = vim.api.nvim_buf_line_count(buf)
+    first = to_line_number(first, count)
+    end_ = end_ == nil and first or to_line_number(end_, count)
+    if first < 1 or first > count then
+      return 0
+    end
+    end_ = math.min(end_, count)
+    vim.api.nvim_buf_set_lines(buf, first - 1, end_, false, {})
+    return 1
+  end
+
+  function vim.fn.bufnr(expr)
+    expr = tostring(expr)
+    if expr == '%' or expr == '' then
+      return vim.api.nvim_get_current_buf()
+    elseif expr == '$' then
+      local buffers = vim.api.nvim_list_bufs()
+      return buffers[#buffers] or -1
+    elseif expr == '#' then
+      return -1
+    end
+    local num = tonumber(expr)
+    if num then
+      return vim.api.nvim_buf_is_valid(num) and num or -1
+    end
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+      local name = vim.api.nvim_buf_get_name(buf)
+      if name == expr then
+        return buf
+      end
+      if name ~= '' then
+        local base = vim.fn.fnamemodify(name, ':t')
+        if base == expr or name:sub(-#expr) == expr then
+          return buf
+        end
+      end
+    end
+    return -1
+  end
+
+  function vim.fn.bufname(expr)
+    expr = tostring(expr)
+    if expr == '%' then
+      return vim.api.nvim_buf_get_name(0)
+    end
+    local buf = vim.fn.bufnr(expr)
+    if buf < 1 then
+      return ''
+    end
+    return vim.api.nvim_buf_get_name(buf)
+  end
+
+  function vim.fn.bufexists(expr)
+    return vim.fn.bufnr(expr) >= 1 and 1 or 0
+  end
+
+  function vim.fn.buflisted(expr)
+    return vim.fn.bufexists(expr)
+  end
+
+  function vim.fn.getbufvar(buf, name, default)
+    buf = buf == 0 and vim.api.nvim_get_current_buf() or vim.fn.bufnr(buf)
+    if buf < 1 or not vim.api.nvim_buf_is_valid(buf) then
+      return default
+    end
+    local ok, value = pcall(vim.api.nvim_buf_get_var, buf, name)
+    if not ok then
+      return default ~= nil and default or ''
+    end
+    return value
+  end
+
+  function vim.fn.setbufvar(buf, name, value)
+    buf = buf == 0 and vim.api.nvim_get_current_buf() or vim.fn.bufnr(buf)
+    if buf >= 1 and vim.api.nvim_buf_is_valid(buf) then
+      vim.api.nvim_buf_set_var(buf, name, value)
+    end
+    return 0
+  end
+
+  function vim.fn.getwinvar(win, name, default)
+    win = win == 0 and vim.api.nvim_get_current_win() or win
+    if win == nil or win < 0 then
+      return default
+    end
+    local ok, value = pcall(vim.api.nvim_win_get_var, win, name)
+    if not ok then
+      return default ~= nil and default or ''
+    end
+    return value
+  end
+
+  function vim.fn.setwinvar(win, name, value)
+    win = win == 0 and vim.api.nvim_get_current_win() or win
+    if win ~= nil and win > 0 then
+      vim.api.nvim_win_set_var(win, name, value)
+    end
+    return 0
+  end
+
+  function vim.fn.gettabvar(tab, name, default)
+    tab = tab == 0 and vim.api.nvim_get_current_tabpage() or tab
+    local ok, value = pcall(vim.api.nvim_tabpage_get_var, tab, name)
+    if not ok then
+      return default ~= nil and default or ''
+    end
+    return value
+  end
+
+  function vim.fn.settabvar(tab, name, value)
+    tab = tab == 0 and vim.api.nvim_get_current_tabpage() or tab
+    vim.api.nvim_tabpage_set_var(tab, name, value)
+    return 0
+  end
+
+  function vim.fn.gettabwinvar(tab, win, name, default)
+    return vim.fn.getwinvar(win, name, default)
+  end
+
+  function vim.fn.getreg(reg, ...)
+    reg = reg == nil or reg == '' and '"' or tostring(reg)
+    return registers[reg] or ''
+  end
+
+  function vim.fn.setreg(reg, value, opts)
+    reg = tostring(reg == nil or reg == '' and '"' or reg)
+    registers[reg] = value
+    return 0
+  end
+
+  function vim.fn.getregtype(reg)
+    reg = tostring(reg == nil or reg == '' and '"' or reg)
+    if registers[reg] == nil then
+      return ''
+    end
+    return 'v'
+  end
+
+  function vim.fn.strchars(s)
+    s = tostring(s)
+    local count = 0
+    for _ in s:gmatch('[%z\1-\127\194-\244][\128-\191]*') do
+      count = count + 1
+    end
+    return count
+  end
+
+  function vim.fn.strdisplaywidth(s, col)
+    return vim.api.nvim_strwidth(tostring(s))
+  end
+
+  function vim.fn.strpart(s, start, len, ...)
+    s = tostring(s)
+    start = tonumber(start) or 0
+    if len == nil then
+      return s:sub(start + 1)
+    end
+    if tonumber(len) < 0 then
+      return s:sub(start + 1)
+    end
+    return s:sub(start + 1, start + tonumber(len))
+  end
+
+  function vim.fn.stridx(haystack, needle, start)
+    haystack, needle = tostring(haystack), tostring(needle)
+    local from = (tonumber(start) or 0) + 1
+    local found = haystack:find(needle, from, true)
+    if not found then
+      return -1
+    end
+    return found - 1
+  end
+
+  function vim.fn.escape(s, chars)
+    s, chars = tostring(s), tostring(chars)
+    return (s:gsub('[' .. chars:gsub('([%^%$%(%)%%%.%[%]%*%+%-%?])', '%%%1') .. ']', '\\%0'))
+  end
+
+  function vim.fn.fnameescape(s)
+    return (tostring(s):gsub('([%s\\!%[%]%*%?%%#$\'"`|{}<>])', '\\%1'))
+  end
+
+  function vim.fn.shellescape(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+  end
+end
+
+do
+  -- Text helpers.
+  function vim.fn.split(s, sep, ...)
+    s = tostring(s)
+    local keepempty = false
+    for _, opt in ipairs({ ... }) do
+      if opt == 1 then
+        keepempty = true
+      end
+    end
+    local out = {}
+    if sep == nil or sep == '' then
+      for ch in s:gmatch('.') do
+        out[#out + 1] = ch
+      end
+      return out
+    end
+    sep = tostring(sep)
+    local pattern = '([^' .. sep:gsub('([%^%$%(%)%%%.%[%]%*%+%-%?])', '%%%1') .. ']*)'
+    for part in s:gmatch(pattern) do
+      if part ~= '' or keepempty then
+        out[#out + 1] = part
+      end
+    end
+    return out
+  end
+
+  function vim.fn.join(list, sep)
+    local parts = {}
+    for _, value in ipairs(list) do
+      parts[#parts + 1] = tostring(value)
+    end
+    return table.concat(parts, sep or ' ')
+  end
+
+  function vim.fn.toupper(s)
+    return tostring(s):upper()
+  end
+
+  function vim.fn.tolower(s)
+    return tostring(s):lower()
+  end
+
+  vim.fn['repeat'] = function(s, count)
+    return string.rep(tostring(s), tonumber(count) or 0)
+  end
+
+  -- Feature detection. zigvim reports the Neovim version it emulates so that
+  -- plugins performing version checks follow their Neovim code path.
+  local emulated = { major = 0, minor = 12, patch = 6 }
+
+  function vim.fn.has(feature)
+    feature = tostring(feature)
+    if feature == 'nvim' or feature == 'nvim_lua' or feature == 'lua' then
+      return 1
+    end
+    -- Accept both nvim-0.8 and nvim-0.8.0 (lazy.nvim asks for the latter).
+    local major, minor, patch = feature:match('^nvim%-(%d+)%.(%d+)%.?(%d*)$')
+    if major then
+      major, minor, patch = tonumber(major), tonumber(minor), tonumber(patch) or 0
+      if major ~= emulated.major then
+        return major < emulated.major and 1 or 0
+      end
+      if minor ~= emulated.minor then
+        return minor < emulated.minor and 1 or 0
+      end
+      return patch <= emulated.patch and 1 or 0
+    end
+    local os_name = vim.uv.os_uname().sysname
+    local is_windows = os_name:match('Windows') ~= nil
+    local flags = {
+      unix = not is_windows,
+      win32 = is_windows,
+      win64 = is_windows,
+      win16 = false,
+      mac = os_name == 'Darwin',
+      macunix = os_name == 'Darwin',
+      linux = os_name == 'Linux',
+      eval = true,
+      ttyin = true,
+      ttyout = true,
+      gui = false,
+      gui_running = false,
+      clipboard = false,
+      python = false,
+      python3 = false,
+      vim9script = false,
+      job = true,
+      channel = true,
+      timers = true,
+      nvim_exec2 = true,
+      rightleft = false,
+      signcolumn = true,
+    }
+    local value = flags[feature]
+    return value and 1 or 0
+  end
+
+  local builtin_commands = {}
+  for _, name in ipairs({
+    'edit', 'e', 'write', 'w', 'wq', 'x', 'xit', 'quit', 'q', 'qa', 'qall',
+    'set', 'setlocal', 'let', 'lua', 'echo', 'silent', 'enew', 'source', 'so',
+    'runtime', 'ru', 'autocmd', 'au', 'augroup', 'aug', 'highlight', 'hi',
+    'syntax', 'syn', 'colorscheme', 'colo', 'map', 'nmap', 'vmap', 'imap',
+    'nnoremap', 'vnoremap', 'inoremap', 'command', 'delcommand', 'normal',
+    'buffer', 'b', 'bnext', 'bn', 'bprev', 'bp', 'bdelete', 'bd', 'split',
+    'sp', 'vsplit', 'vsp', 'tabnew', 'tabedit', 'tabnext', 'tabprevious',
+    'close', 'packadd', 'lcd', 'cd', 'pwd', 'version', 'help', 'messages',
+  }) do
+    builtin_commands[name] = true
+  end
+
+  local function vvar_exists(name)
+    return vim.v[name] ~= nil and 1 or 0
+  end
+
+  function vim.fn.exists(expr)
+    expr = tostring(expr)
+    local kind, rest = expr:sub(1, 1), expr:sub(2)
+    if kind == '*' then
+      return vim.fn[rest] ~= nil and 1 or 0
+    elseif kind == '&' then
+      return option_defaults[rest] ~= nil and 1 or 0
+    elseif kind == ':' then
+      return builtin_commands[rest] and 2 or 0
+    elseif kind == '$' then
+      return os.getenv(rest) ~= nil and 1 or 0
+    elseif kind == '#' then
+      return 0
+    elseif kind == 'g' and rest:sub(1, 1) == ':' then
+      return vim.g[rest:sub(2)] ~= nil and 1 or 0
+    elseif kind == 'b' and rest:sub(1, 1) == ':' then
+      return vim.b[rest:sub(2)] ~= nil and 1 or 0
+    elseif kind == 'w' and rest:sub(1, 1) == ':' then
+      return vim.w[rest:sub(2)] ~= nil and 1 or 0
+    elseif kind == 't' and rest:sub(1, 1) == ':' then
+      return vim.t[rest:sub(2)] ~= nil and 1 or 0
+    elseif kind == 'v' and rest:sub(1, 1) == ':' then
+      return vvar_exists(rest:sub(2))
+    end
+    return vim.fn[expr] ~= nil and 1 or 0
+  end
+
+  function vim.fn.mode(expr)
+    local mode = vim.api.nvim_get_mode().mode
+    if expr == 1 then
+      return mode
+    end
+    return mode
+  end
+
+  function vim.fn.visualmode(...)
+    return 'v'
+  end
+
+  function vim.fn.winnr(...)
+    return 1
+  end
+
+  function vim.fn.tabpagenr(...)
+    return 1
+  end
+
+  function vim.fn.bufwinnr(buf)
+    buf = vim.fn.bufnr(buf)
+    return buf == vim.api.nvim_get_current_buf() and 1 or -1
+  end
+
+  function vim.fn.winheight(win)
+    return vim.api.nvim_win_get_height(win or 0)
+  end
+
+  function vim.fn.winwidth(win)
+    return vim.api.nvim_win_get_width(win or 0)
+  end
+
+  function vim.fn.expandcmd(expr)
+    return vim.fn.expand(expr)
+  end
+end
+
+-- ------------------------------------------------- vim.fn file and shell API
+do
+  local function glob_match(pattern, name)
+    local regex = pattern:gsub('([%^%$%(%)%%%.%[%]%+%-])', '%%%1')
+    regex = regex:gsub('%*', '.*'):gsub('%?', '.')
+    return name:match('^' .. regex .. '$') ~= nil
+  end
+
+  function vim.fn.readfile(path, kind, max)
+    path = tostring(path)
+    local f = io.open(path, 'rb')
+    if not f then
+      api_error("Vim:E484: Can't open file " .. path)
+    end
+    local data = f:read('*a') or ''
+    f:close()
+    if kind == 'b' then
+      local bytes = {}
+      for i = 1, #data do
+        bytes[#bytes + 1] = data:byte(i)
+      end
+      return bytes
+    end
+    local lines = {}
+    for line in data:gmatch('([^\n]*)\n') do
+      lines[#lines + 1] = line:gsub('\r$', '')
+    end
+    if data ~= '' and data:sub(-1) ~= '\n' then
+      lines[#lines + 1] = data:match('([^\n]*)$'):gsub('\r$', '')
+    end
+    if max and max > 0 and #lines > max then
+      while #lines > max do
+        lines[#lines] = nil
+      end
+    end
+    return lines
+  end
+
+  function vim.fn.writefile(lines, path, flags)
+    path = tostring(path)
+    local mode = 'w'
+    if flags and flags:find('a') then
+      mode = 'a'
+    end
+    local f = io.open(path, mode .. 'b')
+    if not f then
+      api_error("Vim:E482: Can't open file for writing: " .. path)
+    end
+    if #lines == 0 then
+      f:write('')
+    elseif flags and flags:find('b') then
+      local bytes = {}
+      for _, value in ipairs(lines) do
+        bytes[#bytes + 1] = string.char(value)
+      end
+      f:write(table.concat(bytes))
+    else
+      f:write(table.concat(lines, '\n') .. '\n')
+    end
+    f:close()
+    return 0
+  end
+
+  function vim.fn.glob(pattern, nosuf, list)
+    pattern = tostring(pattern)
+    local dir, base = pattern:match('^(.-)([^/]*)$')
+    if dir == '' then
+      dir = '.'
+    end
+    local entries = vim.uv._scandir_list(dir) or {}
+    local matches = {}
+    for _, name in ipairs(entries) do
+      if glob_match(base, name) then
+        local full
+        if dir == '/' then
+          full = '/' .. name
+        elseif dir:sub(-1) == '/' then
+          full = dir .. name
+        else
+          full = dir .. '/' .. name
+        end
+        matches[#matches + 1] = full
+      end
+    end
+    table.sort(matches)
+    if list then
+      return matches
+    end
+    return table.concat(matches, '\n')
+  end
+
+  function vim.fn.globpath(paths, pattern, ...)
+    local matches = {}
+    for dir in tostring(paths):gmatch('[^,]+') do
+      local found = vim.fn.glob(dir .. '/' .. pattern)
+      if found ~= '' then
+        for line in found:gmatch('[^\n]+') do
+          matches[#matches + 1] = line
+        end
+      end
+    end
+    return table.concat(matches, '\n')
+  end
+
+  function vim.fn.simplify(path)
+    path = tostring(path)
+    local absolute = path:sub(1, 1) == '/'
+    local parts = {}
+    for part in path:gmatch('[^/]+') do
+      if part == '.' then
+        -- skip
+      elseif part == '..' then
+        if #parts > 0 and parts[#parts] ~= '..' then
+          parts[#parts] = nil
+        elseif not absolute then
+          parts[#parts + 1] = '..'
+        end
+      else
+        parts[#parts + 1] = part
+      end
+    end
+    local out = table.concat(parts, '/')
+    if absolute then
+      out = '/' .. out
+    end
+    if out == '' then
+      return absolute and '/' or '.'
+    end
+    return out
+  end
+
+  function vim.fn.pathshorten(path, length)
+    path = tostring(path)
+    length = tonumber(length) or 1
+    local absolute = path:sub(1, 1) == '/'
+    local parts = {}
+    for part in path:gmatch('[^/]+') do
+      parts[#parts + 1] = part
+    end
+    local out = {}
+    for i, part in ipairs(parts) do
+      if i < #parts then
+        out[i] = part:sub(1, length)
+      else
+        out[i] = part
+      end
+    end
+    return (absolute and '/' or '') .. table.concat(out, '/')
+  end
+
+  function vim.fn.resolve(path)
+    path = tostring(path)
+    return vim.uv.fs_realpath(path) or path
+  end
+
+  function vim.fn.tempname()
+    return os.tmpname()
+  end
+
+  function vim.fn.delete(path, flags)
+    path = tostring(path)
+    flags = flags or ''
+    if flags:find('d') or flags:find('r') then
+      local command
+      if vim.uv.os_uname().sysname:match('Windows') then
+        command = 'rmdir /s /q "' .. path .. '" 2>nul'
+      else
+        command = "rm -rf '" .. path:gsub("'", "'\\''") .. "' 2>/dev/null"
+      end
+      local ok = os.execute(command)
+      return (ok == true or ok == 0) and 0 or -1
+    end
+    local ok = os.remove(path)
+    return ok and 0 or -1
+  end
+
+  function vim.fn.rename(from, to)
+    local ok = os.rename(tostring(from), tostring(to))
+    return ok and 0 or -1
+  end
+
+  local function shell_quote(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+  end
+
+  -- Accepts a command string or an argv list (like Neovim), merges stderr
+  -- into the output and records the exit status in v:shell_error.
+  function vim.fn.system(cmd, _input)
+    local command
+    if type(cmd) == 'table' then
+      local parts = {}
+      for i, arg in ipairs(cmd) do
+        parts[i] = shell_quote(arg)
+      end
+      command = table.concat(parts, ' ')
+    else
+      command = tostring(cmd)
+    end
+    local handle = io.popen('(' .. command .. ') 2>&1; echo "__ZIGVIM_RC__$?"')
+    if not handle then
+      vvars.shell_error = 1
+      return ''
+    end
+    local raw = handle:read('*a') or ''
+    handle:close()
+    local output, status = raw:match('^(.*)__ZIGVIM_RC__(%d+)%s*$')
+    if not output then
+      vvars.shell_error = 0
+      return raw
+    end
+    vvars.shell_error = tonumber(status) or 0
+    return output
+  end
+
+  function vim.fn.systemlist(cmd)
+    local output = vim.fn.system(cmd)
+    local list = {}
+    for line in output:gmatch('([^\n]*)\n') do
+      list[#list + 1] = line
+    end
+    if output ~= '' and output:sub(-1) ~= '\n' then
+      list[#list + 1] = output:match('([^\n]*)$')
+    end
+    return list
+  end
+
+  function vim.fn.reg_executing()
+    return ''
+  end
+
+  function vim.fn.reg_recording()
+    return ''
+  end
+
+  function vim.fn.histadd(kind, item)
+    return 1
+  end
+
+  local quickfix = {}
+  local quickfix_title = ''
+
+  function vim.fn.setqflist(list, ...)
+    quickfix = vim.deepcopy(list or {})
+    quickfix_title = ':setqflist()'
+    return 0
+  end
+
+  function vim.fn.getqflist(opts)
+    if type(opts) == 'table' and opts.title ~= nil then
+      return { title = quickfix_title }
+    end
+    local out = {}
+    for i, item in ipairs(quickfix) do
+      out[i] = {
+        bufnr = item.bufnr or 0,
+        lnum = item.lnum or 0,
+        end_lnum = item.end_lnum or 0,
+        col = item.col or 0,
+        end_col = item.end_col or 0,
+        text = item.text or '',
+        type = item.type or '',
+        nr = item.nr or 0,
+        valid = 1,
+        pattern = item.pattern or '',
+        module = item.module or '',
+        vcol = 0,
+      }
+    end
+    return out
+  end
 end
