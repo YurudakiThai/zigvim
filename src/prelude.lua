@@ -2155,15 +2155,15 @@ vim.loader = {
 
 -- Load the user's init.lua when running as an editor (not for -l scripts).
 function vim._load_init()
+  -- Load user init.lua if it exists
   local path = vim.fn.stdpath('config') .. '/init.lua'
   local f = io.open(path, 'r')
-  if not f then
-    return false
-  end
-  f:close()
-  local ok, err = pcall(dofile, path)
-  if not ok then
-    io.stderr:write('Error in init.lua: ' .. tostring(err) .. '\n')
+  if f then
+    f:close()
+    local ok, err = pcall(dofile, path)
+    if not ok then
+      io.stderr:write('Error in init.lua: ' .. tostring(err) .. '\n')
+    end
   end
   
   -- Source runtime plugins (plugin/*.lua files from runtime path)
