@@ -155,6 +155,7 @@ Rule of thumb: if a plugin can observe it, it must go through `vim.api` — not 
 | `augroup`, `packadd`, `filetype`, `syntax`, `highlight` Ex commands accepted and ignored | No highlighter / Vimscript behind them. | Highlight groups and `:syntax` exist. |
 | `vim.fn.getcompletion` handles only `color` | Only completion kind lazy.nvim needs. | A plugin needs other kinds. |
 | `vim.fn.getchar` returns 27 | Only used on lazy.nvim's failure path. | Real input queue is exposed to Lua. |
+| `vim.api.nvim__redraw` (no-op) | Private API used by vim.diagnostic; zigvim has no redraw mechanism. | Real TUI redraw is implemented. |
 
 When you add or remove a stub, edit this table in the same commit.
 

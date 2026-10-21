@@ -979,6 +979,11 @@ function vim.api.nvim_clear_autocmds(_)
   autocmds = {}
 end
 
+-- Stub: nvim__redraw is a private API used by vim.diagnostic and other modules.
+-- No-op for now since zigvim doesn't have a real redraw mechanism.
+function vim.api.nvim__redraw(_)
+end
+
 -- ------------------------------------------------------------ defer_fn
 -- Implemented in Lua on top of the real libuv timer handles.
 function vim.defer_fn(fn, ms)
@@ -1527,6 +1532,21 @@ local function exec_cmd(cmd)
             error(tostring(err), 0)
           end
           chunk()
+        else
+          -- .vim file: parse and execute simple 'lua' commands
+          local f = io.open(found, 'r')
+          if f then
+            for line in f:lines() do
+              local lua_code = line:match('^%s*lua%s+(.*)$')
+              if lua_code then
+                local chunk, err = loadstring(lua_code)
+                if chunk then
+                  chunk()
+                end
+              end
+            end
+            f:close()
+          end
         end
         break
       end
@@ -3032,7 +3052,7 @@ do
       id = id,
       events = list,
       group = group,
-      pattern = opts.pattern and as_list(opts.pattern) or nil,
+      pattern = opts.pattern and as_list(opts.pattern) or { '*' },
       buffer = opts.buffer,
       callback = opts.callback,
       command = opts.command,
