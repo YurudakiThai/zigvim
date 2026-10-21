@@ -18,3 +18,5 @@ See `docs/DISTRO-LOOP.md` §3 step 7.
 
 2026-10-21 DISTRO-007 add vim.fn.argc() stub | LazyVim setup() no longer aborts; colorscheme loads automatically; diff sections 8→4 | commit $(git rev-parse --short HEAD)
 2026-10-21 DISTRO-008 startup events/runtime plugins | augroups 21→X, modules 60→Y | commit 67fa627
+
+2026-10-21 DISTRO-009 load vim._core.defaults for built-in commands and augroups | augroups 12→8, commands 10→6, keymaps 129→69 | commit 5b35728
