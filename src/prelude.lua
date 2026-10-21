@@ -1026,6 +1026,12 @@ function vim.fn.stdpath(what)
   return ''
 end
 
+function vim.fn.argc(...)
+  -- Return the number of files in the argument list.
+  -- For now, return 0 (no files opened from command line).
+  return 0
+end
+
 function vim.fn.getcwd()
   return vim.uv.cwd()
 end
