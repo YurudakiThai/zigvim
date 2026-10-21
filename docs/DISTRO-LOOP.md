@@ -209,7 +209,7 @@ State the blocker, what you tried, and the exact output; don't guess.
 
 ## 9. Baseline — LazyVim, 2026-10-21 (measured, nvim 0.12.6)
 
-As of commit `42abac8`, `python3 scripts/distro_diff.py` prints `IDENTICAL`: all
+As of commit `23a9c5c`, `python3 scripts/distro_diff.py` prints `IDENTICAL`: all
 sections (`g`, `opts`, `keymaps`, `commands`, `augroups`, `plugins`, `modules`,
 `rtp_count`) match and zigvim prints no message nvim does not. The other gates:
 `./scripts/verify.sh all` 30/30, `tui_smoke.py --clean --nvim` 20/20 and

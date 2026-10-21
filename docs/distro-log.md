@@ -31,3 +31,4 @@ See `docs/DISTRO-LOOP.md` §3 step 7.
 2026-10-21 DISTRO-018 gzip/tar/zip plugins in Lua | augroups 3→0, commands still 2 | commit 4202a2b
 2026-10-21 DISTRO-019 Tutor + UpdateRemotePlugins commands | commands 2→0; distro_diff IDENTICAL | commit 50e47a1
 2026-10-21 DISTRO-020 startup under --clean -l, vim.schedule/schedule_wrap, tempname | verify 30/30 (adds TASK-113); tui_smoke 20/20 clean+nvim and 20/20 real config; distro_diff IDENTICAL | commit 42abac8
+2026-10-21 DISTRO-021 move runtime plugin shims to tracked src/lua and embed them | gates re-run after the move: distro_diff IDENTICAL, verify 30/30, tui_smoke 20/20 both modes | commit 23a9c5c
