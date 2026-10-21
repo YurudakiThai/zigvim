@@ -4695,10 +4695,21 @@ if not ok_defaults then
   io.stderr:write('Warning: failed to load vim._core.defaults: ' .. tostring(err_defaults) .. '\n')
 end
 
--- Load matchit stub (creates matchit mappings that Neovim's matchit.vim plugin creates)
+-- Runtime plugins that Neovim ships as Vimscript, reimplemented in Lua.
+-- matchit.vim: mappings plus the MatchEnable/MatchDisable/MatchDebug commands.
 local ok_matchit, matchit_stub = pcall(require, 'vim._matchit_stub')
 if ok_matchit then
+  vim.g.loaded_matchit = 1
+  matchit_stub.define_commands()
   matchit_stub.setup()
 else
   io.stderr:write('Warning: failed to load vim._matchit_stub: ' .. tostring(matchit_stub) .. '\n')
+end
+
+-- matchparen.vim: the matchparen augroup and :DoMatchParen/:NoMatchParen.
+local ok_matchparen, matchparen = pcall(require, 'vim._matchparen')
+if ok_matchparen then
+  matchparen.setup()
+else
+  io.stderr:write('Warning: failed to load vim._matchparen: ' .. tostring(matchparen) .. '\n')
 end
