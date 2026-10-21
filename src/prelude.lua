@@ -1362,8 +1362,28 @@ local function fire_autocmd(event, opts)
   end
 end
 
+-- Autocmds that take over reading/writing a path (BufReadCmd/BufWriteCmd,
+-- used by netrw and the archive plugins).
+local function special_autocmds(event, pattern)
+  local ok, list = pcall(vim.api.nvim_get_autocmds, { event = event, pattern = pattern })
+  if ok then
+    return list
+  end
+  return {}
+end
+
 local function edit_path(path)
   local full = vim.fn.fnamemodify(path, ':p')
+  if #special_autocmds('BufReadCmd', path) > 0 then
+    vim.api.nvim_buf_set_name(0, path)
+    vim._buf_set_modified(0, false)
+    fire_autocmd('BufReadPre', {buffer = 0, pattern = path})
+    fire_autocmd('BufReadCmd', {buffer = 0, pattern = path})
+    fire_autocmd('BufReadPost', {buffer = 0, pattern = path})
+    fire_autocmd('BufEnter', {buffer = 0})
+    fire_autocmd('BufWinEnter', {buffer = 0})
+    return
+  end
   local lines = read_file(full)
   vim.api.nvim_buf_set_name(0, path)
   vim.api.nvim_buf_set_lines(0, 0, -1, false, lines or { '' })
@@ -1385,6 +1405,11 @@ local function write_current(path)
     error('E32: No file name')
   end
   fire_autocmd('BufWritePre', {buffer = 0})
+  if #special_autocmds('BufWriteCmd', target) > 0 then
+    fire_autocmd('BufWriteCmd', {buffer = 0, pattern = target})
+    fire_autocmd('BufWritePost', {buffer = 0})
+    return
+  end
   write_file(target, buffer_lines())
   vim._buf_set_modified(0, false)
   fire_autocmd('BufWritePost', {buffer = 0})
@@ -1667,9 +1692,15 @@ local function exec_cmd(cmd)
     end
     local value = chunk()
     io.stdout:write(tostring(value) .. '\n')
-  elseif vim._user_commands and vim._user_commands[name] then
-    local user_cmd = vim._user_commands[name]
-    local opts = { name = name, args = rest, line1 = 1, line2 = 1, bang = false }
+  elseif vim._user_commands
+    and (vim._user_commands[name] or (name:sub(-1) == '!' and vim._user_commands[name:sub(1, -2)])) then
+    local bang = name:sub(-1) == '!'
+    local user_cmd = vim._user_commands[bang and name:sub(1, -2) or name]
+    local fargs = {}
+    for word in rest:gmatch('%S+') do
+      fargs[#fargs + 1] = word
+    end
+    local opts = { name = name, args = rest, fargs = fargs, line1 = 1, line2 = 1, bang = bang }
     if type(user_cmd.command) == 'function' then
       user_cmd.command(opts)
     else
@@ -4712,4 +4743,12 @@ if ok_matchparen then
   matchparen.setup()
 else
   io.stderr:write('Warning: failed to load vim._matchparen: ' .. tostring(matchparen) .. '\n')
+end
+
+-- netrw: directory browsing plus the :Explore/:N* commands and Network group.
+local ok_netrw, netrw = pcall(require, 'vim._netrw')
+if ok_netrw then
+  netrw.setup()
+else
+  io.stderr:write('Warning: failed to load vim._netrw: ' .. tostring(netrw) .. '\n')
 end
