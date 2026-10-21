@@ -319,6 +319,27 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
+
+    // Fire VimEnter and UIEnter events (needed by lazy.nvim and other plugins)
+
+    c.lua_getglobal(L, "vim");
+    c.lua_getfield(L, -1, "_exec_autocmds");
+    c.lua_pushstring(L, "VimEnter");
+    c.lua_newtable(L);
+    if (c.lua_pcall(L, 2, 0, 0) != 0) {
+        c.lua_pop(L, 1); // pop error message
+    }
+
+    c.lua_getfield(L, -1, "_exec_autocmds");
+    c.lua_pushstring(L, "UIEnter");
+    c.lua_newtable(L);
+    if (c.lua_pcall(L, 2, 0, 0) != 0) {
+        c.lua_pop(L, 1); // pop error message
+    }
+
+    c.lua_pop(L, 1); // pop vim table
+
+
     var quit_requested = false;
     for (cmds.items) |cmd| {
         _ = execVimCommand(L, cmd);

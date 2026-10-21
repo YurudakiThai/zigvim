@@ -91,6 +91,8 @@ Run `./scripts/progress.sh` to see:
 - **docs/NEOVIM-COMPAT-PLAN.md** — architecture and roadmap
 - **docs/differential-test-harness.md** — test infrastructure design
 - **docs/vibe-coding-playbook.md** — workflow guide
+- **docs/DISTRO-LOOP.md** — the measure→fix→verify loop for making LazyVim/AstroNvim behave like Neovim (start here for distro work)
+- **docs/distro-log.md** — one line per loop iteration, so progress survives between sessions
 - **tasks/** — task cards (RESET-001 through PHASE5-XXX)
 - **specs/api-surface.md** — machine-readable API contract
 
