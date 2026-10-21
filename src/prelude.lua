@@ -2633,25 +2633,38 @@ vim.api.nvim_set_keymap = function(mode, lhs, rhs, opts)
 end
 
 vim.api.nvim_get_keymap = function(mode)
-  local list = keymaps[norm_mode(mode)] or {}
+  local m = norm_mode(mode)
+  -- v, x, and s modes share mappings
+  local sources = {m}
+  if m == 'v' or m == 'x' or m == 's' then
+    sources = {'v', 'x', 's'}
+  end
+  
   local copy = {}
-  for i, map in ipairs(list) do
-    -- Return a copy with normalized lhs
-    copy[i] = {
-      lhs = map.lhs,
-      mode = map.mode,
-      noremap = map.noremap,
-      silent = map.silent,
-      desc = map.desc,
-      callback = map.callback,
-      rhs = map.rhs,
-      buffer = 0,
-      nowait = map.nowait or 0,
-      expr = map.expr or 0,
-      script = 0,
-      sid = 0,
-      lnum = 0,
-    }
+  local seen = {}
+  for _, src in ipairs(sources) do
+    local list = keymaps[src] or {}
+    for _, map in ipairs(list) do
+      -- Avoid duplicates (same lhs)
+      if not seen[map.lhs] then
+        seen[map.lhs] = true
+        copy[#copy + 1] = {
+          lhs = map.lhs,
+          mode = map.mode,
+          noremap = map.noremap,
+          silent = map.silent,
+          desc = map.desc,
+          callback = map.callback,
+          rhs = map.rhs,
+          buffer = 0,
+          nowait = map.nowait or 0,
+          expr = map.expr or 0,
+          script = 0,
+          sid = 0,
+          lnum = 0,
+        }
+      end
+    end
   end
   return copy
 end
@@ -4392,4 +4405,12 @@ end
 local ok_defaults, err_defaults = pcall(require, 'vim._core.defaults')
 if not ok_defaults then
   io.stderr:write('Warning: failed to load vim._core.defaults: ' .. tostring(err_defaults) .. '\n')
+end
+
+-- Load matchit stub (creates matchit mappings that Neovim's matchit.vim plugin creates)
+local ok_matchit, matchit_stub = pcall(require, 'vim._matchit_stub')
+if ok_matchit then
+  matchit_stub.setup()
+else
+  io.stderr:write('Warning: failed to load vim._matchit_stub: ' .. tostring(matchit_stub) .. '\n')
 end
