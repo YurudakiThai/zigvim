@@ -303,9 +303,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (file_arg != null or cmds.items.len > 0) {
         // Editor mode: load configuration, open the requested file, then run
         // the -c commands in order (Neovim CLI semantics).
-        if (!clean) {
-            _ = loadUserConfig(L, init_file);
-        }
+        _ = startupEditor(L, init_file, clean);
         if (file_arg) |path| {
             const cmd = std.fmt.allocPrint(gpa, "edit {s}", .{path}) catch unreachable;
             defer gpa.free(cmd);
@@ -313,7 +311,7 @@ pub fn main(init: std.process.Init) !void {
         }
     } else if (!headless and isInteractive()) {
         // Plain `zigvim`: empty buffer in the terminal UI.
-        if (!clean) _ = loadUserConfig(L, init_file);
+        _ = startupEditor(L, init_file, clean);
     } else {
         std.debug.print("Usage: zigvim <file> [-c <cmd>...] | zigvim -l <script.lua> [-c <cmd>...] | zigvim --embed\n", .{});
         std.process.exit(1);
@@ -396,6 +394,26 @@ fn execVimCommand(L: *c.lua_State, cmd: []const u8) bool {
         c.lua_pop(L, 1);
         return false;
     }
+    c.lua_pop(L, 1);
+    return true;
+}
+
+/// Run the editor startup: an explicit -u init file (if any) first, then
+/// Neovim's defaults and runtime plugins. --clean skips the user config but
+/// still runs the defaults, matching `nvim --clean`.
+fn startupEditor(L: *c.lua_State, init_file: ?[]const u8, clean: bool) bool {
+    if (init_file != null and !loadUserConfig(L, init_file)) return false;
+    c.lua_getglobal(L, "vim");
+    c.lua_getfield(L, -1, "_startup");
+    c.lua_pushboolean(L, if (init_file != null or clean) 1 else 0);
+    if (c.lua_pcall(L, 1, 1, 0) != 0) {
+        const err = c.lua_tolstring(L, -1, null);
+        if (err != null) std.debug.print("{s}\n", .{std.mem.span(err)});
+        c.lua_pop(L, 1);
+        c.lua_pop(L, 1);
+        return false;
+    }
+    c.lua_pop(L, 1);
     c.lua_pop(L, 1);
     return true;
 }

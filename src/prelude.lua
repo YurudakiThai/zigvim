@@ -831,6 +831,13 @@ local function buf_opt_set(id, k, v)
     buffer_options[id] = opts
   end
   opts[k] = v
+  -- Like :set, changing these options runs the matching events.
+  local key = option_aliases[k] or k
+  if (key == 'filetype') and type(v) == 'string' then
+    vim.api.nvim_exec_autocmds('FileType', { pattern = v, buffer = id })
+  elseif key == 'syntax' and type(v) == 'string' then
+    vim.api.nvim_exec_autocmds('Syntax', { pattern = v, buffer = id })
+  end
 end
 
 local function make_bo(id)
@@ -905,8 +912,31 @@ vim.g = setmetatable({}, {
 })
 
 local buffer_vars = {}
+local function buffer_var_table(id)
+  if id == 0 then
+    id = vim.api.nvim_get_current_buf()
+  end
+  return setmetatable({}, {
+    __index = function(_, k)
+      local vars = buffer_vars[id]
+      return vars and vars[k]
+    end,
+    __newindex = function(_, k, v)
+      local vars = buffer_vars[id]
+      if not vars then
+        vars = {}
+        buffer_vars[id] = vars
+      end
+      vars[k] = v
+    end,
+  })
+end
+
 vim.b = setmetatable({}, {
   __index = function(_, k)
+    if type(k) == 'number' then
+      return buffer_var_table(k)
+    end
     local vars = buffer_vars[vim.api.nvim_get_current_buf()]
     return vars and vars[k]
   end,
@@ -1030,6 +1060,12 @@ function vim.fn.argc(...)
   -- Return the number of files in the argument list.
   -- For now, return 0 (no files opened from command line).
   return 0
+end
+
+-- True once filetype detection has set 'filetype' for the buffer. Neovim keeps
+-- this in script state; the buffer option is the observable equivalent here.
+function vim.fn.did_filetype()
+  return vim.bo.filetype ~= '' and 1 or 0
 end
 
 function vim.fn.getcwd()
@@ -1601,6 +1637,29 @@ local function exec_cmd(cmd)
       error(err)
     end
     vim.g[var:sub(3)] = chunk()
+  elseif name == 'setf' or name == 'setfiletype' then
+    -- :setf [FALLBACK] name / :setfiletype name. Setting 'filetype' fires
+    -- FileType (see buf_opt_set), which drives ftplugin/indent loading.
+    local args = {}
+    for word in rest:gmatch('%S+') do
+      args[#args + 1] = word
+    end
+    local first = args[1]
+    local fallback = false
+    if first == 'FALLBACK' then
+      fallback = true
+      table.remove(args, 1)
+      first = args[1]
+    end
+    if name == 'setfiletype' and vim.bo.filetype ~= '' then
+      return
+    end
+    if first and first ~= '' then
+      if not fallback then
+        vim.b.did_filetype = 1
+      end
+      vim.bo.filetype = first
+    end
   elseif name == 'echo' then
     local chunk, err = loadstring('return ' .. rest)
     if not chunk then
@@ -1691,6 +1750,30 @@ end
 
 vim.api.nvim_command = function(cmd)
   exec_lines(cmd, false)
+end
+
+-- Minimal nvim_cmd(): enough for callers (Neovim's runtime, plugins) that build
+-- commands from a table instead of a string. Unknown commands fall back to the
+-- same :command parser the rest of the editor uses.
+vim.api.nvim_cmd = function(cmd, _opts)
+  cmd = cmd or {}
+  local name = cmd.cmd or ''
+  local args = cmd.args or {}
+  if name == '' then
+    api_error("Invalid 'cmd': expected a command name")
+  end
+  local parts = { name }
+  if cmd.bang then
+    parts[1] = name .. '!'
+  end
+  for _, arg in ipairs(args) do
+    parts[#parts + 1] = tostring(arg)
+  end
+  if cmd.count and cmd.count ~= 0 then
+    table.insert(parts, 2, tostring(cmd.count))
+  end
+  exec_lines(table.concat(parts, ' '), false)
+  return nil
 end
 
 vim.api.nvim_exec2 = function(src, _)
@@ -1803,22 +1886,45 @@ vim.api.nvim_list_runtime_paths = function()
   return to_list(list_get('runtimepath'))
 end
 
+-- Expand {a,b} alternatives, as Neovim does for :runtime patterns.
+local function expand_braces(pattern)
+  local start = pattern:find('{', 1, true)
+  if not start then
+    return { pattern }
+  end
+  local finish = pattern:find('}', start, true)
+  if not finish then
+    return { pattern }
+  end
+  local prefix, body, suffix = pattern:sub(1, start - 1), pattern:sub(start + 1, finish - 1), pattern:sub(finish + 1)
+  local out = {}
+  for alt in (body .. ','):gmatch('([^,]*),') do
+    for _, expanded in ipairs(expand_braces(prefix .. alt .. suffix)) do
+      out[#out + 1] = expanded
+    end
+  end
+  return out
+end
+vim._expand_braces = expand_braces
+
 vim.api.nvim_get_runtime_file = function(name, all)
   local found = {}
   for _, dir in ipairs(list_get('runtimepath')) do
-    local pattern = dir .. '/' .. name
-    local matches
-    if pattern:find('[*?]') then
-      matches = vim.fn.glob(pattern, false, true)
-    elseif vim.uv.fs_stat(pattern) then
-      matches = { pattern }
-    else
-      matches = {}
-    end
-    for _, match in ipairs(matches) do
-      found[#found + 1] = match
-      if not all then
-        return found
+    for _, sub in ipairs(expand_braces(name)) do
+      local pattern = dir .. '/' .. sub
+      local matches
+      if pattern:find('[*?]') then
+        matches = vim.fn.glob(pattern, false, true)
+      elseif vim.uv.fs_stat(pattern) then
+        matches = { pattern }
+      else
+        matches = {}
+      end
+      for _, match in ipairs(matches) do
+        found[#found + 1] = match
+        if not all then
+          return found
+        end
       end
     end
   end
@@ -2154,29 +2260,33 @@ vim.loader = {
 }
 
 -- Load the user's init.lua when running as an editor (not for -l scripts).
-function vim._load_init()
-  -- Load user init.lua if it exists
-  local path = vim.fn.stdpath('config') .. '/init.lua'
-  local f = io.open(path, 'r')
-  if f then
-    f:close()
-    local ok, err = pcall(dofile, path)
-    if not ok then
-      io.stderr:write('Error in init.lua: ' .. tostring(err) .. '\n')
+-- Startup sequence, mirroring Neovim: user init.lua, then filetype/syntax
+-- defaults, then every plugin/*.lua on the runtimepath. `skip_user_config`
+-- implements --clean (defaults and runtime plugins still run, as in nvim).
+function vim._startup(skip_user_config)
+  if not skip_user_config then
+    local path = vim.fn.stdpath('config') .. '/init.lua'
+    local f = io.open(path, 'r')
+    if f then
+      f:close()
+      local ok, err = pcall(dofile, path)
+      if not ok then
+        io.stderr:write('Error in init.lua: ' .. tostring(err) .. '\n')
+      end
     end
   end
-  
+
+  -- Neovim enables filetype detection, ftplugins, indent and syntax between
+  -- init.lua and the runtime plugins; plugins may rely on it being on.
+  vim._setup_filetype()
+
   -- Source runtime plugins (plugin/*.lua files from runtime path)
-  -- This matches Neovim's startup sequence: after loading user config,
-  -- source all plugin/*.lua and plugin/*.vim files from &runtimepath
   local rtp = vim.o.runtimepath
   if rtp and rtp ~= '' then
     for dir in rtp:gmatch('[^,]+') do
       local plugin_dir = dir .. '/plugin'
-      -- Check if plugin directory exists
       local stat = vim.uv.fs_stat(plugin_dir)
       if stat and stat.type == 'directory' then
-        -- Scan for .lua files in plugin directory
         local files = vim.uv._scandir_list(plugin_dir) or {}
         table.sort(files)  -- Sort to ensure consistent loading order
         for _, name in ipairs(files) do
@@ -2192,8 +2302,12 @@ function vim._load_init()
       end
     end
   end
-  
+
   return true
+end
+
+function vim._load_init()
+  return vim._startup(false)
 end
 
 -- ----------------------------------------------------------- variables API
@@ -3144,7 +3258,13 @@ do
     local pattern_filter = filter.pattern and as_list(filter.pattern) or nil
     local group_filter = filter.group
     if type(group_filter) == 'string' then
-      group_filter = state.groups[group_filter]
+      local name = group_filter
+      group_filter = state.groups[name]
+      if not group_filter then
+        api_error("Invalid 'group': '" .. name .. "'")
+      end
+    elseif group_filter ~= nil and not state.group_names[group_filter] and group_filter ~= 0 then
+      api_error("Invalid 'group': '" .. tostring(group_filter) .. "'")
     end
     local entries = {}
     for _, record in pairs(state.items) do
@@ -3205,9 +3325,30 @@ do
     return name
   end
 
+  -- Vim's event aliases: an autocmd registered for BufRead also runs when
+  -- BufReadPost fires (and BufWrite for BufWritePre).
+  local function expand_event_aliases(events)
+    local out, seen = {}, {}
+    local function add(name)
+      if not seen[name] then
+        seen[name] = true
+        out[#out + 1] = name
+      end
+    end
+    for _, name in ipairs(events) do
+      add(name)
+      if name == 'BufReadPost' then
+        add('BufRead')
+      elseif name == 'BufWritePre' then
+        add('BufWrite')
+      end
+    end
+    return out
+  end
+
   vim._exec_autocmds = function(event, opts)
     opts = opts or {}
-    local events = validate_events(event)
+    local events = expand_event_aliases(validate_events(event))
     local buffer = opts.buffer
     if buffer == nil or buffer == 0 then
       buffer = vim.api.nvim_get_current_buf()
@@ -4407,6 +4548,142 @@ do
       }
     end
     return out
+  end
+end
+
+-- ------------------------------------------- filetype detection and plugins
+-- Neovim turns on filetype detection, filetype plugins, indent plugins and
+-- syntax at startup (runtime/filetype.lua, ftplugin.vim, indent.vim,
+-- syntax/syntax.vim). zigvim has no Vimscript engine, so the same startup
+-- state and events are created here; Lua ftplugins/indent files are sourced
+-- with :runtime semantics, the .vim ones are covered by the stub register.
+local function source_ft_lua(subdir, name, filename)
+  local chunk, err = loadfile(filename)
+  if not chunk then
+    error(err, 0)
+  end
+  chunk()
+end
+
+local function load_ft_files(subdir, name)
+  for _, dir in ipairs(list_get('runtimepath')) do
+    local base = dir .. '/' .. subdir
+    local exact = base .. '/' .. name .. '.lua'
+    if vim.uv.fs_stat(exact) then
+      source_ft_lua(subdir, name, exact)
+    end
+    local entries = vim.uv._scandir_list(base) or {}
+    table.sort(entries)
+    for _, entry in ipairs(entries) do
+      if entry:sub(1, #name + 1) == name .. '_' and entry:match('%.lua$') then
+        source_ft_lua(subdir, name, base .. '/' .. entry)
+      end
+    end
+    local nested = base .. '/' .. name
+    local nested_entries = vim.uv._scandir_list(nested) or {}
+    table.sort(nested_entries)
+    for _, entry in ipairs(nested_entries) do
+      if entry:match('%.lua$') then
+        source_ft_lua(subdir, name, nested .. '/' .. entry)
+      end
+    end
+  end
+end
+
+local function load_ftplugin()
+  local ft = vim.bo.filetype
+  if ft == '' then
+    return
+  end
+  local undo = vim.b.undo_ftplugin
+  if undo and undo ~= '' then
+    pcall(exec_cmd, undo)
+  end
+  vim.b.undo_ftplugin = nil
+  vim.b.did_ftplugin = nil
+  for name in ft:gmatch('[^.]+') do
+    load_ft_files('ftplugin', name)
+  end
+end
+
+local function load_indent()
+  local ft = vim.bo.filetype
+  if ft == '' then
+    return
+  end
+  local undo = vim.b.undo_indent
+  if undo and undo ~= '' then
+    pcall(exec_cmd, undo)
+  end
+  vim.b.undo_indent = nil
+  vim.b.did_indent = nil
+  for name in ft:gmatch('[^.]+') do
+    load_ft_files('indent', name)
+  end
+end
+
+local function set_syntax_from_filetype()
+  if vim.b.ts_highlight then
+    return
+  end
+  local ft = vim.bo.filetype
+  if ft ~= '' then
+    vim.bo.syntax = ft
+  end
+end
+
+function vim._setup_filetype()
+  if not vim.g.did_load_filetypes then
+    vim.g.did_load_filetypes = 1
+    vim.api.nvim_create_augroup('filetypedetect', { clear = false })
+    local function detect(ev)
+      if not vim.api.nvim_buf_is_valid(ev.buf) then
+        return
+      end
+      local ft, on_detect = vim.filetype.match({ filename = ev.file, buf = ev.buf })
+      if not ft then
+        return
+      end
+      if on_detect then
+        on_detect(ev.buf)
+      end
+      vim.api.nvim_buf_call(ev.buf, function()
+        vim.bo.filetype = ft
+      end)
+    end
+    vim.api.nvim_create_autocmd({ 'BufRead', 'BufNewFile', 'StdinReadPost' }, {
+      group = 'filetypedetect',
+      pattern = '*',
+      callback = detect,
+    })
+    if not vim.g.ft_ignore_pat then
+      vim.g.ft_ignore_pat = '\\.\\(Z\\|gz\\|bz2\\|zip\\|tgz\\)$'
+    end
+    -- Lua filetype detection plugins (`ftdetect/*.lua`), in runtimepath order.
+    for _, file in ipairs(vim.api.nvim_get_runtime_file('ftdetect/*.lua', true)) do
+      local chunk = loadfile(file)
+      if chunk then
+        chunk()
+      end
+    end
+  end
+
+  if not vim.g.did_load_ftplugin then
+    vim.g.did_load_ftplugin = 1
+    local group = vim.api.nvim_create_augroup('filetypeplugin', { clear = false })
+    vim.api.nvim_create_autocmd('FileType', { group = group, pattern = '*', callback = load_ftplugin })
+  end
+
+  if not vim.g.did_indent_on then
+    vim.g.did_indent_on = 1
+    local group = vim.api.nvim_create_augroup('filetypeindent', { clear = false })
+    vim.api.nvim_create_autocmd('FileType', { group = group, pattern = '*', callback = load_indent })
+  end
+
+  if not vim.g.syntax_on then
+    vim.g.syntax_on = 1
+    local group = vim.api.nvim_create_augroup('syntaxset', { clear = false })
+    vim.api.nvim_create_autocmd('FileType', { group = group, pattern = '*', callback = set_syntax_from_filetype })
   end
 end
 
