@@ -1997,8 +1997,12 @@ vim.api.nvim_replace_termcodes = function(str, from_part, do_lt, special)
         local token = result:sub(i, j)
         local token_lower = token:lower()
         
+        -- Check for <Space> - normalize to literal space
+        if token_lower == '<space>' then
+          table.insert(out, ' ')
+          i = j + 1
         -- Check for <Plug> - keep whole
-        if token_lower == '<plug>' then
+        elseif token_lower == '<plug>' then
           table.insert(out, token)
           i = j + 1
           while i <= len do
@@ -2006,40 +2010,46 @@ vim.api.nvim_replace_termcodes = function(str, from_part, do_lt, special)
             i = i + 1
           end
           break
-        end
-        
-        -- Control character
-        local ctrl_match = token:match('^<[Cc]%-(.)>$')
-        if ctrl_match then
-          local ch = ctrl_match:upper()
-          table.insert(out, '<C-' .. ch .. '>')
-          i = j + 1
         else
-          -- Special key
-          local normalized = special_key_names[token_lower]
-          if normalized then
-            table.insert(out, normalized)
+          -- Control character
+          local ctrl_match = token:match('^<[Cc]%-(.)>$')
+          if ctrl_match then
+            local ch = ctrl_match:upper()
+            table.insert(out, '<C-' .. ch .. '>')
             i = j + 1
           else
-            -- Modifier keys
-            local mod_match = token:match('^<([SsMmAaDdCc])%-(.+)>$')
-            if mod_match then
-              local mod = mod_match:sub(1, 1):upper()
-              local key = mod_match:sub(2)
-              local key_normalized = special_key_names['<' .. key:lower() .. '>']
-              if key_normalized then
-                key = key_normalized:sub(2, -2)
-              end
-              table.insert(out, '<' .. mod .. '-' .. key .. '>')
+            -- Special key
+            local normalized = special_key_names[token_lower]
+            if normalized then
+              table.insert(out, normalized)
               i = j + 1
             else
-              table.insert(out, token)
-              i = j + 1
+              -- Modifier keys: <S-x>, <M-x>, <A-x>, <D-x>, <C-x>
+              local mod, key = token:match('^<([SsMmAaDdCc])%-(.+)>$')
+              if mod then
+                mod = mod:upper()
+                local key_normalized = special_key_names['<' .. key:lower() .. '>']
+                if key_normalized then
+                  key = key_normalized:sub(2, -2)
+                end
+                -- <S-a> through <S-z> normalize to uppercase letters
+                if mod == 'S' and #key == 1 and key:match('[a-zA-Z]') then
+                  table.insert(out, key:upper())
+                else
+                  table.insert(out, '<' .. mod .. '-' .. key .. '>')
+                end
+                i = j + 1
+              else
+                -- Unknown token, normalize < to <lt> and reprocess rest
+                table.insert(out, '<lt>')
+                i = i + 1
+              end
             end
           end
         end
       else
-        table.insert(out, result:sub(i, i))
+        -- No closing >, normalize < to <lt>
+        table.insert(out, '<lt>')
         i = i + 1
       end
     else
@@ -2454,8 +2464,12 @@ local function normalize_lhs(lhs)
         local token = result:sub(i, j)
         local token_lower = token:lower()
         
+        -- Check for <Space> - normalize to literal space
+        if token_lower == '<space>' then
+          table.insert(out, ' ')
+          i = j + 1
         -- Check for <Plug> - keep whole, don't normalize inside
-        if token_lower == '<plug>' then
+        elseif token_lower == '<plug>' then
           -- Keep <Plug> and the rest as-is until end or next <
           table.insert(out, token)
           i = j + 1
@@ -2465,45 +2479,49 @@ local function normalize_lhs(lhs)
             i = i + 1
           end
           break
-        end
-        
-        -- Check for control character: <c-x>, <C-x>, <C-X>, <c-X>
-        local ctrl_match = token:match('^<[Cc]%-(.)>$')
-        if ctrl_match then
-          -- Normalize to <C-X> (uppercase)
-          local ch = ctrl_match:upper()
-          table.insert(out, '<C-' .. ch .. '>')
-          i = j + 1
         else
-          -- Check for other special keys
-          local normalized = special_key_names[token_lower]
-          if normalized then
-            table.insert(out, normalized)
+          -- Check for control character: <c-x>, <C-x>, <C-X>, <c-X>
+          local ctrl_match = token:match('^<[Cc]%-(.)>$')
+          if ctrl_match then
+            -- Normalize to <C-X> (uppercase)
+            local ch = ctrl_match:upper()
+            table.insert(out, '<C-' .. ch .. '>')
             i = j + 1
           else
-            -- Check for modifier keys: <S-x>, <M-x>, <A-x>, <D-x>, <C-x>
-            local mod_match = token:match('^<([SsMmAaDdCc])%-(.+)>$')
-            if mod_match then
-              local mod = mod_match:sub(1, 1):upper()
-              local key = mod_match:sub(2)
-              -- Normalize the key part if it's a special key
-              local key_normalized = special_key_names['<' .. key:lower() .. '>']
-              if key_normalized then
-                -- Extract just the key name without brackets
-                key = key_normalized:sub(2, -2)
-              end
-              table.insert(out, '<' .. mod .. '-' .. key .. '>')
+            -- Check for other special keys
+            local normalized = special_key_names[token_lower]
+            if normalized then
+              table.insert(out, normalized)
               i = j + 1
             else
-              -- Unknown token, keep as-is
-              table.insert(out, token)
-              i = j + 1
+              -- Check for modifier keys: <S-x>, <M-x>, <A-x>, <D-x>, <C-x>
+              local mod, key = token:match('^<([SsMmAaDdCc])%-(.+)>$')
+              if mod then
+                mod = mod:upper()
+                -- Normalize the key part if it's a special key
+                local key_normalized = special_key_names['<' .. key:lower() .. '>']
+                if key_normalized then
+                  -- Extract just the key name without brackets
+                  key = key_normalized:sub(2, -2)
+                end
+                -- <S-a> through <S-z> normalize to uppercase letters
+                if mod == 'S' and #key == 1 and key:match('[a-zA-Z]') then
+                  table.insert(out, key:upper())
+                else
+                  table.insert(out, '<' .. mod .. '-' .. key .. '>')
+                end
+                i = j + 1
+              else
+                -- Unknown token, normalize < to <lt> and reprocess rest
+                table.insert(out, '<lt>')
+                i = i + 1  -- Move past the <, will reprocess the rest
+              end
             end
           end
         end
       else
-        -- No closing >, keep as-is
-        table.insert(out, result:sub(i, i))
+        -- No closing >, normalize < to <lt>
+        table.insert(out, '<lt>')
         i = i + 1
       end
     else
