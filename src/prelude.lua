@@ -3502,7 +3502,7 @@ do
     'vim.F', 'vim.func', 'vim.fs', 'vim.iter', 'vim.text', 'vim.re', 'vim.pos',
     'vim.range', 'vim.net', 'vim.filetype', 'vim.secure', 'vim.pack',
     'vim.health', 'vim.loader', 'vim._watch', 'vim.version', 'vim.hl',
-    'vim.diagnostic', 'vim.keymap', 'vim.lsp',
+    'vim.keymap',
   }
   for _, mod in ipairs(modules) do
     local field = mod:sub(5)
@@ -3513,6 +3513,32 @@ do
       end
     end
   end
+end
+
+-- Lazy-load heavy modules on first access (matches Neovim's behavior)
+do
+  local lazy_modules = {
+    diagnostic = 'vim.diagnostic',
+    lsp = 'vim.lsp',
+    treesitter = 'vim.treesitter',
+  }
+  local vim_mt = getmetatable(vim) or {}
+  local old_index = vim_mt.__index
+  vim_mt.__index = function(t, k)
+    local modname = lazy_modules[k]
+    if modname then
+      local ok, lib = pcall(require, modname)
+      if ok and lib ~= nil then
+        rawset(t, k, lib)
+        return lib
+      end
+    end
+    if old_index then
+      return old_index(t, k)
+    end
+    return nil
+  end
+  setmetatable(vim, vim_mt)
 end
 
 -- ----------------------------------------------------------- extmarks API
