@@ -2634,10 +2634,14 @@ end
 
 vim.api.nvim_get_keymap = function(mode)
   local m = norm_mode(mode)
-  -- v, x, and s modes share mappings
+  -- v mode includes x and s; x includes v; s includes v
   local sources = {m}
-  if m == 'v' or m == 'x' or m == 's' then
+  if m == 'v' then
     sources = {'v', 'x', 's'}
+  elseif m == 'x' then
+    sources = {'v', 'x'}
+  elseif m == 's' then
+    sources = {'v', 's'}
   end
   
   local copy = {}
