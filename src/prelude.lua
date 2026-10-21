@@ -2147,6 +2147,34 @@ function vim._load_init()
   if not ok then
     io.stderr:write('Error in init.lua: ' .. tostring(err) .. '\n')
   end
+  
+  -- Source runtime plugins (plugin/*.lua files from runtime path)
+  -- This matches Neovim's startup sequence: after loading user config,
+  -- source all plugin/*.lua and plugin/*.vim files from &runtimepath
+  local rtp = vim.o.runtimepath
+  if rtp and rtp ~= '' then
+    for dir in rtp:gmatch('[^,]+') do
+      local plugin_dir = dir .. '/plugin'
+      -- Check if plugin directory exists
+      local stat = vim.uv.fs_stat(plugin_dir)
+      if stat and stat.type == 'directory' then
+        -- Scan for .lua files in plugin directory
+        local files = vim.uv._scandir_list(plugin_dir) or {}
+        table.sort(files)  -- Sort to ensure consistent loading order
+        for _, name in ipairs(files) do
+          if name:match('%.lua$') then
+            local plugin_path = plugin_dir .. '/' .. name
+            local plugin_ok, plugin_err = pcall(dofile, plugin_path)
+            if not plugin_ok then
+              io.stderr:write('Error in ' .. plugin_path .. ': ' .. tostring(plugin_err) .. '\n')
+            end
+          end
+          -- Skip .vim files for now (no Vimscript engine yet)
+        end
+      end
+    end
+  end
+  
   return true
 end
 
@@ -2902,7 +2930,7 @@ do
   local known_events = {}
   for _, event in ipairs({
     'BufAdd', 'BufDelete', 'BufEnter', 'BufFilePost', 'BufFilePre', 'BufHidden',
-    'BufLeave', 'BufNew', 'BufNewFile', 'BufReadCmd', 'BufReadPost',
+    'BufLeave', 'BufNew', 'BufNewFile', 'BufRead', 'BufReadCmd', 'BufReadPost',
     'BufReadPre', 'BufUnload', 'BufWinEnter', 'BufWinLeave', 'BufWipeout',
     'BufWriteCmd', 'BufWritePost', 'BufWritePre', 'ChanInfo', 'ChanOpen',
     'CmdUndefined', 'CmdlineChanged', 'CmdlineEnter', 'CmdlineLeave',
@@ -3104,6 +3132,10 @@ do
     filter = filter or {}
     local event_filter = filter.event and validate_events(filter.event) or nil
     local pattern_filter = filter.pattern and as_list(filter.pattern) or nil
+    local group_filter = filter.group
+    if type(group_filter) == 'string' then
+      group_filter = state.groups[group_filter]
+    end
     local entries = {}
     for _, record in pairs(state.items) do
       local event_ok = true
@@ -3116,7 +3148,7 @@ do
           end
         end
       end
-      local group_ok = filter.group == nil or record.group == filter.group
+      local group_ok = group_filter == nil or record.group == group_filter
       local buffer_ok = filter.buffer == nil or record.buffer == filter.buffer
       local pattern_ok = true
       if pattern_filter then
@@ -3129,6 +3161,7 @@ do
               id = record.id,
               event = event,
               group = record.group,
+              group_name = state.group_names[record.group],
               pattern = record.pattern and record.pattern[1] or nil,
               command = record.command or '',
               callback = record.callback,
