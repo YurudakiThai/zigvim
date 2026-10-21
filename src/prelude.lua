@@ -4253,7 +4253,10 @@ do
     elseif kind == '&' then
       return option_defaults[rest] ~= nil and 1 or 0
     elseif kind == ':' then
-      return builtin_commands[rest] and 2 or 0
+      if builtin_commands[rest] or (vim._user_commands and vim._user_commands[rest]) then
+        return 2
+      end
+      return 0
     elseif kind == '$' then
       return os.getenv(rest) ~= nil and 1 or 0
     elseif kind == '#' then
@@ -4759,4 +4762,20 @@ if ok_archives then
   archives.setup()
 else
   io.stderr:write('Warning: failed to load vim._archives: ' .. tostring(archives) .. '\n')
+end
+
+-- tutor.vim: the :Tutor command.
+local ok_tutor, tutor = pcall(require, 'vim._tutor')
+if ok_tutor then
+  tutor.setup()
+else
+  io.stderr:write('Warning: failed to load vim._tutor: ' .. tostring(tutor) .. '\n')
+end
+
+-- rplugin.vim: the manifest and :UpdateRemotePlugins command.
+local ok_remote, remote = pcall(require, 'vim._remote')
+if ok_remote then
+  remote.setup()
+else
+  io.stderr:write('Warning: failed to load vim._remote: ' .. tostring(remote) .. '\n')
 end
