@@ -1520,8 +1520,14 @@ local function exec_cmd(cmd)
     -- Vimscript files are not supported yet and are skipped.
   elseif name == 'augroup' or name == 'aug' or name == 'packadd' or name == 'filetype'
     or name == 'syntax' or name == 'syn' or name == 'highlight' or name == 'hi'
-    or name == 'highlight!' or name == 'hi!' then
-    -- Accepted and ignored: no Vimscript engine / highlighter behind these yet.
+    or name == 'highlight!' or name == 'hi!'
+    or name == 'menu' or name == 'amenu' or name == 'nmenu' or name == 'vmenu'
+    or name == 'imenu' or name == 'cmenu' or name == 'omenu' or name == 'tmenu'
+    or name == 'noremenu' or name == 'anoremenu' or name == 'nnoremenu'
+    or name == 'vnoremenu' or name == 'inoremenu' or name == 'cnoremenu'
+    or name == 'onoremenu' or name == 'tnoremenu'
+    or name == 'unmenu' or name == 'aunmenu' then
+    -- Accepted and ignored: no Vimscript engine / highlighter / menu system behind these yet.
   elseif name == 'colorscheme' or name == 'colo' then
     local scheme = rest
     if scheme == '' then
@@ -4378,4 +4384,12 @@ do
     end
     return out
   end
+end
+
+-- Load Neovim's default commands, mappings, and augroups
+-- This creates Inspect, InspectTree, EditQuery, Open commands and
+-- nvim.cmdwin, nvim.popupmenu, nvim.swapfile, nvim.terminal augroups
+local ok_defaults, err_defaults = pcall(require, 'vim._core.defaults')
+if not ok_defaults then
+  io.stderr:write('Warning: failed to load vim._core.defaults: ' .. tostring(err_defaults) .. '\n')
 end
