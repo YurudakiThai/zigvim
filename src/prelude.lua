@@ -4752,3 +4752,11 @@ if ok_netrw then
 else
   io.stderr:write('Warning: failed to load vim._netrw: ' .. tostring(netrw) .. '\n')
 end
+
+-- gzip.vim / tarPlugin.vim / zipPlugin.vim: compressed files and archives.
+local ok_archives, archives = pcall(require, 'vim._archives')
+if ok_archives then
+  archives.setup()
+else
+  io.stderr:write('Warning: failed to load vim._archives: ' .. tostring(archives) .. '\n')
+end
