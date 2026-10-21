@@ -20,3 +20,7 @@ See `docs/DISTRO-LOOP.md` §3 step 7.
 2026-10-21 DISTRO-008 startup events/runtime plugins | augroups 21→X, modules 60→Y | commit 67fa627
 
 2026-10-21 DISTRO-009 load vim._core.defaults for built-in commands and augroups | augroups 12→8, commands 10→6, keymaps 129→69 | commit 5b35728
+
+2026-10-21 DISTRO-010 v/x/s keymap sharing + matchit stub | keymaps missing 129→0, extra 9→5 | commit 864e377
+
+2026-10-21 DISTRO-011 fix nvim_get_keymap v/x/s mode query | keymaps extra 5→0, section IDENTICAL | commit 80f4c81

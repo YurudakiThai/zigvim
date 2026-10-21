@@ -388,14 +388,14 @@ local option_defaults = {
   shiftwidth = 8,
   softtabstop = 0,
   expandtab = false,
-  autoindent = false,
+  autoindent = true,
   smartindent = false,
   ignorecase = false,
   smartcase = false,
-  hlsearch = false,
-  incsearch = false,
-  ruler = false,
-  showmode = false,
+  hlsearch = true,
+  incsearch = true,
+  ruler = true,
+  showmode = true,
   laststatus = 2,
   cmdheight = 1,
   background = 'dark',
@@ -406,7 +406,7 @@ local option_defaults = {
   readonly = false,
   modified = false,
   termguicolors = false,
-  mouse = '',
+  mouse = 'nvi',
   clipboard = '',
   loadplugins = true,
 }
@@ -1503,6 +1503,12 @@ local function exec_cmd(cmd)
         vim.go[option] = true
       end
     end
+  elseif name == 'luafile' or name == 'luaf' then
+    local chunk, err = loadfile(rest)
+    if not chunk then
+      error("E484: Can't open file " .. rest .. (err and (': ' .. tostring(err)) or ''), 0)
+    end
+    chunk()
   elseif name == 'source' or name == 'so' then
     local path = rest
     if path:sub(1, 1) == '~' then
@@ -2487,105 +2493,80 @@ local function find_keymap(list, lhs)
   return nil
 end
 
--- Normalize a keymap lhs to match Neovim's canonical form.
--- Rules:
--- 1. <leader> -> vim.g.mapleader or '\'
--- 2. <localleader> -> vim.g.maplocalleader or '\'
--- 3. Control chars: <c-x>, <C-x>, <c-X> -> <C-X>
--- 4. Special keys normalized to canonical form
--- 5. <Plug> mappings kept whole (not normalized inside)
+-- Spell an lhs the way nvim_get_keymap() reports it: <c-s> -> <C-S>, <leader> and
+-- <Space> -> the literal key, <S-h> -> H, <a-j> -> <M-j>, a lone '<' -> <lt>.
+-- shortcut: lhs only; rhs, mode bits and lhsraw are not normalized, add them when a plugin reads them.
+local key_names = {}
+for name in ([[CR Esc Tab BS Del NL Nul Up Down Left Right Home End PageUp PageDown Insert Help Undo
+  Plug Cmd SNR Space lt Bar Bslash Ignore kUp kDown kLeft kRight kHome kEnd kOrigin kPageUp kPageDown
+  kDel kPlus kMinus kMultiply kDivide kPoint kComma kEqual kEnter LeftMouse LeftDrag LeftRelease
+  MiddleMouse MiddleDrag MiddleRelease RightMouse RightDrag RightRelease X1Mouse X1Drag X1Release
+  X2Mouse X2Drag X2Release ScrollWheelUp ScrollWheelDown ScrollWheelLeft ScrollWheelRight MouseMove]]):gmatch('%S+') do
+  key_names[name:lower()] = name
+end
+for i = 1, 37 do
+  key_names['f' .. i] = 'F' .. i
+end
+for i = 0, 9 do
+  key_names['k' .. i] = 'k' .. i
+end
+key_names['return'], key_names['enter'] = 'CR', 'CR'
+
+local mod_letters = { s = 'S', c = 'C', m = 'M', a = 'M', t = 'T', d = 'D' }
+local char_names = { [' '] = 'Space', ['|'] = 'Bar', ['\\'] = 'Bslash' }
+local plain_names = { Space = ' ', Bar = '|', Bslash = '\\', lt = '<lt>' }
+
 local function normalize_lhs(lhs)
   if type(lhs) ~= 'string' then
     return lhs
   end
-  -- Expand <leader> and <localleader> first
-  local leader = vim.g.mapleader
-  if leader == nil or leader == '' then
-    leader = '\\'
-  end
-  local localleader = vim.g.maplocalleader
-  if localleader == nil or localleader == '' then
-    localleader = '\\'
-  end
-  
-  -- Replace <leader> and <localleader> (case-insensitive)
-  local result = lhs:gsub('<[Ll][Ee][Aa][Dd][Ee][Rr]>', leader)
-  result = result:gsub('<[Ll][Oo][Cc][Aa][Ll][Ll][Ee][Aa][Dd][Ee][Rr]>', localleader)
-  
-  -- Process angle-bracket sequences
-  local out = {}
-  local i = 1
-  local len = #result
-  while i <= len do
-    if result:sub(i, i) == '<' then
-      -- Find closing >
-      local j = result:find('>', i + 1, true)
-      if j then
-        local token = result:sub(i, j)
-        local token_lower = token:lower()
-        
-        -- Check for <Space> - normalize to literal space
-        if token_lower == '<space>' then
-          table.insert(out, ' ')
-          i = j + 1
-        -- Check for <Plug> - keep whole, don't normalize inside
-        elseif token_lower == '<plug>' then
-          -- Keep <Plug> and the rest as-is until end or next <
-          table.insert(out, token)
-          i = j + 1
-          -- Copy rest of string
-          while i <= len do
-            table.insert(out, result:sub(i, i))
-            i = i + 1
-          end
-          break
-        else
-          -- Check for control character: <c-x>, <C-x>, <C-X>, <c-X>
-          local ctrl_match = token:match('^<[Cc]%-(.)>$')
-          if ctrl_match then
-            -- Normalize to <C-X> (uppercase)
-            local ch = ctrl_match:upper()
-            table.insert(out, '<C-' .. ch .. '>')
-            i = j + 1
-          else
-            -- Check for other special keys
-            local normalized = special_key_names[token_lower]
-            if normalized then
-              table.insert(out, normalized)
-              i = j + 1
-            else
-              -- Check for modifier keys: <S-x>, <M-x>, <A-x>, <D-x>, <C-x>
-              local mod, key = token:match('^<([SsMmAaDdCc])%-(.+)>$')
-              if mod then
-                mod = mod:upper()
-                -- Normalize the key part if it's a special key
-                local key_normalized = special_key_names['<' .. key:lower() .. '>']
-                if key_normalized then
-                  -- Extract just the key name without brackets
-                  key = key_normalized:sub(2, -2)
-                end
-                -- <S-a> through <S-z> normalize to uppercase letters
-                if mod == 'S' and #key == 1 and key:match('[a-zA-Z]') then
-                  table.insert(out, key:upper())
-                else
-                  table.insert(out, '<' .. mod .. '-' .. key .. '>')
-                end
-                i = j + 1
-              else
-                -- Unknown token, normalize < to <lt> and reprocess rest
-                table.insert(out, '<lt>')
-                i = i + 1  -- Move past the <, will reprocess the rest
-              end
-            end
-          end
-        end
+  local out, i = {}, 1
+  while i <= #lhs do
+    local inner = lhs:sub(i, i) == '<' and lhs:match('^<([^<>]+)>', i)
+    local mods, name = {}, inner
+    while name do
+      local letter, rest = name:match('^(%a)%-(.+)$')
+      if letter and mod_letters[letter:lower()] then
+        mods[mod_letters[letter:lower()]] = true
+        name = rest
       else
-        -- No closing >, normalize < to <lt>
-        table.insert(out, '<lt>')
-        i = i + 1
+        break
       end
+    end
+    local lower = name and name:lower()
+    local special = lower and key_names[lower]
+    local is_char = name and name:match('^[\1-\127\194-\244][\128-\191]*$')
+    local has_mods = next(mods) ~= nil
+    local leader = name and not has_mods and (lower == 'leader' or lower == 'localleader')
+    if leader then
+      local value = vim.g[lower == 'leader' and 'mapleader' or 'maplocalleader']
+      out[#out + 1] = (type(value) == 'string' and value ~= '') and value or '\\'
+    elseif special or is_char then
+      local key = special or name
+      if not special and key:match('^%a$') then
+        if mods.C then
+          key = key:upper()
+        elseif mods.S then
+          key, mods.S = key:upper(), nil
+        end
+        has_mods = next(mods) ~= nil
+      end
+      local named = char_names[key] or key
+      if has_mods then
+        local prefix = ''
+        for _, letter in ipairs({ 'M', 'T', 'C', 'S', 'D' }) do
+          prefix = prefix .. (mods[letter] and (letter .. '-') or '')
+        end
+        out[#out + 1] = '<' .. prefix .. named .. '>'
+      else
+        out[#out + 1] = plain_names[named] or (special and ('<' .. named .. '>')) or key
+      end
+    end
+    if leader or special or is_char then
+      i = i + #inner + 2
     else
-      table.insert(out, result:sub(i, i))
+      local ch = lhs:sub(i, i)
+      out[#out + 1] = ch == '<' and '<lt>' or ch
       i = i + 1
     end
   end

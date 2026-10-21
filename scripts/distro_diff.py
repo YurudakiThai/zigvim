@@ -46,27 +46,33 @@ def clone_tree(src: Path, dst: Path) -> None:
 
 
 def make_sandbox(config: Path, data: Path, tmp: Path) -> dict:
-    cfg_home = tmp / "config"
-    cfg_home.mkdir(parents=True)
-    shutil.copytree(config, cfg_home / "nvim", symlinks=True, ignore=shutil.ignore_patterns(".git"))
-    data_home = tmp / "data"
-    data_home.mkdir()
-    clone_tree(data, data_home / "nvim")
+    # Use HOME instead of XDG_* variables to avoid zigvim hang bug with XDG paths
+    sandbox_home = tmp / "home"
+    sandbox_home.mkdir(parents=True)
+    shutil.copytree(config, sandbox_home / ".config" / "nvim", symlinks=True, ignore=shutil.ignore_patterns(".git"))
+    clone_tree(data, sandbox_home / ".local" / "share" / "nvim")
     for name in ("state", "cache"):
-        (tmp / name).mkdir()
+        (sandbox_home / ".local" / name).mkdir(parents=True)
+    
     env = dict(os.environ)
     env.update(
-        XDG_CONFIG_HOME=str(cfg_home),
-        XDG_DATA_HOME=str(data_home),
-        XDG_STATE_HOME=str(tmp / "state"),
-        XDG_CACHE_HOME=str(tmp / "cache"),
+        HOME=str(sandbox_home),
         GIT_TERMINAL_PROMPT="0",
     )
     return env
 
 
 def run_editor(name: str, binary: str, env: dict, out_path: Path, timeout: int) -> dict:
-    env = dict(env, PROBE_OUT=str(out_path))
+    # Own home per editor to isolate cache/state and avoid zigvim XDG hang bug
+    scratch = out_path.parent
+    editor_home = scratch / f"home-{name}"
+    editor_home.mkdir(exist_ok=True)
+    # Copy minimal structure
+    (editor_home / ".local" / "share" / "nvim").mkdir(parents=True, exist_ok=True)
+    (editor_home / ".local" / "state" / "nvim").mkdir(parents=True, exist_ok=True)
+    (editor_home / ".cache" / "nvim").mkdir(parents=True, exist_ok=True)
+    
+    env = dict(env, HOME=str(editor_home), PROBE_OUT=str(out_path))
     cmd = [binary, "--headless", "-c", f"lua dofile('{PROBE}')", "-c", "qa!"]
     started = time.time()
     try:

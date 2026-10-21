@@ -58,7 +58,7 @@ def_autocmd('BufWriteCmd', {}, function(ev)
   end
 end)
 
-def_autocmd({ 'FileWriteCmd', 'FileAppendCmd' }, {}, function(ev)
+def_autocmd('FileWriteCmd', {}, function(ev)
   vim.fn.writefile(
     shada_get_binstrings(
       vim.fn.getline(
@@ -67,7 +67,7 @@ def_autocmd({ 'FileWriteCmd', 'FileAppendCmd' }, {}, function(ev)
       ) --[=[@as string[]]=]
     ),
     ev.file,
-    ev.event == 'FileAppendCmd' and 'ab' or 'b'
+    'b'
   )
 end)
 
