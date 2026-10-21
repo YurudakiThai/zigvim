@@ -10,4 +10,4 @@ See `docs/DISTRO-LOOP.md` §3 step 7.
 
 2026-10-21 DISTRO-003 fire VimEnter/UIEnter in headless mode | partial fix; lazy.nvim plugin loading still incomplete | commit f2e9185
 
-2026-10-21 DISTRO-004 autocmd pattern + colorscheme .vim + nvim__redraw stub | autocmd default pattern nil→{'*'} (fixes lazy.nvim event handlers); colorscheme handler executes .vim files; nvim__redraw stub fixes TASK-110 | verify 28/28 pass; distro_diff unchanged (plugin loading still incomplete) | uncommitted
+2026-10-21 DISTRO-004 autocmd pattern + colorscheme .vim + nvim__redraw stub | autocmd default pattern nil→{'*'} (fixes lazy.nvim event handlers); colorscheme handler executes .vim files; nvim__redraw stub fixes TASK-110 | verify 28/28 pass; distro_diff unchanged (plugin loading still incomplete) | commit cdeafda
