@@ -290,6 +290,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (lua_script) |path| {
+        // `nvim --clean -l script.lua` still runs the startup defaults and
+        // runtime plugins (but not the user config); plain `-l` runs neither.
+        if (clean) _ = startupEditor(L, null, true);
+
         const cpath = try gpa.dupeSentinel(u8, path, 0);
         defer gpa.free(cpath);
 

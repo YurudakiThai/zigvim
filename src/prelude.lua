@@ -1026,6 +1026,23 @@ function vim.defer_fn(fn, ms)
   return timer
 end
 
+-- Run `fn` on the main loop, soon. Neovim schedules this on its event loop;
+-- a zero-delay libuv timer has the same effect here.
+function vim.schedule(fn)
+  vim.defer_fn(fn, 0)
+end
+
+-- Wrap a callback so it is invoked through vim.schedule(). Plugins use this
+-- for callbacks coming from libuv handles and jobs.
+function vim.schedule_wrap(fn)
+  return function(...)
+    local args = { ... }
+    return vim.schedule(function()
+      return fn(unpack(args))
+    end)
+  end
+end
+
 -- --------------------------------------------------------------- vim.fn
 local function home_dir()
   return os.getenv('HOME') or os.getenv('USERPROFILE') or '/'
@@ -4469,7 +4486,10 @@ do
   end
 
   function vim.fn.tempname()
-    return os.tmpname()
+    -- os.tmpname() creates the file; Neovim only returns a fresh name.
+    local name = os.tmpname()
+    os.remove(name)
+    return name
   end
 
   function vim.fn.delete(path, flags)
