@@ -430,6 +430,9 @@ end
 
 alias_table(option_defaults)
 local option_store = alias_table({})
+-- Per-buffer values of buffer-local options, and which options are buffer-local.
+local buffer_options = {}
+local buffer_local = {}
 
 -- Neovim's generated option metadata lists every option with its default and
 -- short name, so use it instead of keeping a hand-written subset.
@@ -438,6 +441,9 @@ do
   if f then
     local text = f:read('*a') or ''
     f:close()
+    for name in text:gmatch('\nvim%.bo%.([%w_]+) = vim%.o%.[%w_]+') do
+      buffer_local[name] = true
+    end
     for name, rhs in text:gmatch('\nvim%.o%.([%w_]+) = ([^\n]+)') do
       local target = rhs:match('^vim%.o%.([%w_]+)$')
       if target then
@@ -470,15 +476,33 @@ end
 local option_mt = {
   __index = function(_, k)
     check_option(k)
+    if buffer_local[option_aliases[k] or k] then
+      local opts = buffer_options[vim.api.nvim_get_current_buf()]
+      local local_value = opts and opts[k]
+      if local_value ~= nil then
+        return local_value
+      end
+    end
     local v = option_store[k]
     if v ~= nil then
       return v
     end
     return option_defaults[k]
   end,
+  -- Like `:set`: sets the global value and, for buffer-local options, the
+  -- current buffer's value too.
   __newindex = function(_, k, v)
     check_option(k)
     option_store[k] = v
+    if buffer_local[option_aliases[k] or k] then
+      local id = vim.api.nvim_get_current_buf()
+      local opts = buffer_options[id]
+      if not opts then
+        opts = alias_table({})
+        buffer_options[id] = opts
+      end
+      opts[k] = v
+    end
   end,
 }
 
@@ -751,14 +775,34 @@ vim.o = setmetatable({}, {
   __newindex = opt_newindex,
 })
 
-vim.go = vim.o
+vim.go = setmetatable({}, {
+  __index = function(_, k)
+    local list = list_option_aliases[k]
+    if list then
+      return table.concat(list_get(list), ',')
+    end
+    check_option(k)
+    local v = option_store[k]
+    if v ~= nil then
+      return v
+    end
+    return option_defaults[k]
+  end,
+  __newindex = function(_, k, v)
+    local list = list_option_aliases[k]
+    if list then
+      list_set(list, v)
+      return
+    end
+    check_option(k)
+    option_store[k] = opt_to_string(k, v)
+  end,
+})
 vim.opt_local = vim.opt
 vim.opt_global = vim.opt
 
 -- Buffer-local options. `modified` is authoritative in the Zig core; the
 -- rest live in this Lua table until the option registry moves down.
-local buffer_options = {}
-
 local function buf_opt_get(id, k)
   if k == 'modified' then
     return vim._buf_modified(id)
@@ -768,6 +812,10 @@ local function buf_opt_get(id, k)
     return opts[k]
   end
   check_buf_option(k)
+  local global = option_store[k]
+  if global ~= nil then
+    return global
+  end
   return option_defaults[k]
 end
 
@@ -1295,24 +1343,76 @@ local function write_current(path)
   fire_autocmd('BufWritePost', {buffer = 0})
 end
 
-local function parse_set(arg)
-  if arg:sub(1, 3) == 'no' then
-    vim.o[arg:sub(3)] = false
+local function set_option_arg(arg)
+  -- name? : Neovim echoes the value; nothing to do here.
+  if arg:sub(-1) == '?' then
     return
   end
-  local name, value = arg:match('^([^=]+)=(.*)$')
+  -- name& : reset to the default value.
+  local reset = arg:match('^([%w_]+)&$')
+  if reset then
+    option_store[reset] = nil
+    return
+  end
+  -- name! / invname : toggle a boolean option.
+  local toggle = arg:match('^([%w_]+)!$') or arg:match('^inv([%w_]+)$')
+  if toggle and rawget(option_defaults, toggle) ~= nil or toggle and option_aliases[toggle] then
+    vim.o[toggle] = not vim.o[toggle]
+    return
+  end
+  -- name=value, name:value, name+=value, name-=value, name^=value
+  local name, op, value = arg:match('^([%w_]+)([%+%-%^]?)[=:](.*)$')
   if name then
-    local num = tonumber(value)
-    if num then
-      vim.o[name] = num
-    elseif value == 'true' or value == 'false' then
-      vim.o[name] = value == 'true'
+    local current = vim.o[name]
+    local function typed(v)
+      if type(current) == 'number' then
+        return tonumber(v) or v
+      end
+      return v
+    end
+    if op == '' then
+      vim.o[name] = typed(value)
+    elseif type(current) == 'number' then
+      local n = tonumber(value) or 0
+      if op == '+' then
+        vim.o[name] = current + n
+      elseif op == '-' then
+        vim.o[name] = current - n
+      else
+        vim.o[name] = current * n
+      end
+    elseif list_option_aliases[name] then
+      local option = vim.opt[name]
+      if op == '+' then
+        option:append(value)
+      elseif op == '-' then
+        option:remove(value)
+      else
+        option:prepend(value)
+      end
     else
-      vim.o[name] = value
+      local option = vim.opt[name]
+      if op == '+' then
+        option:append(value)
+      elseif op == '-' then
+        option:remove(value)
+      else
+        option:prepend(value)
+      end
     end
     return
   end
+  -- noname : turn a boolean option off. Option names never start with "no".
+  local off = arg:match('^no([%w_]+)$')
+  if off then
+    vim.o[off] = false
+    return
+  end
   vim.o[arg] = true
+end
+
+local function parse_set(arg)
+  set_option_arg(arg)
 end
 
 local function exec_cmd(cmd)
@@ -1354,17 +1454,42 @@ local function exec_cmd(cmd)
         fire_autocmd('FileType', {pattern = value})
       end
     end
-  elseif name == 'setlocal' then
+  elseif name == 'setlocal' or name == 'setl' then
     for option in rest:gmatch('%S+') do
-      local key, value = option:match('^([^=]+)=(.*)$')
+      local key, value = option:match('^([%w_]+)[=:](.*)$')
+      local target = key or option
+      local enable = true
+      if not key and option:match('^no[%w_]+$') then
+        target = option:sub(3)
+        enable = false
+      end
+      local function assign(v)
+        if buffer_local[option_aliases[target] or target] then
+          vim.bo[target] = v
+        else
+          vim.wo[target] = v
+        end
+      end
       if key then
-        vim.bo[key] = tonumber(value) or value
+        local current = vim.o[key]
+        assign(type(current) == 'number' and (tonumber(value) or value) or value)
         if key == 'filetype' or key == 'ft' then
-          vim.bo.filetype = value
           fire_autocmd('FileType', {pattern = value})
         end
       else
-        vim.bo[option] = true
+        assign(enable)
+      end
+    end
+  elseif name == 'setglobal' or name == 'setg' then
+    for option in rest:gmatch('%S+') do
+      local key, value = option:match('^([%w_]+)[=:](.*)$')
+      if key then
+        local current = vim.go[key]
+        vim.go[key] = type(current) == 'number' and (tonumber(value) or value) or value
+      elseif option:match('^no[%w_]+$') then
+        vim.go[option:sub(3)] = false
+      else
+        vim.go[option] = true
       end
     end
   elseif name == 'source' or name == 'so' then
@@ -1820,8 +1945,109 @@ vim.uv.fs_fstat = function(fd)
   return { size = size, type = 'file', mtime = { sec = 0, nsec = 0 } }
 end
 
-vim.api.nvim_replace_termcodes = function(str, _from_part, _do_lt, _special)
-  return str
+-- Canonical names for special keys (Neovim normalizes to these forms).
+-- Defined early so nvim_replace_termcodes can use it.
+local special_key_names = {
+  ['<cr>'] = '<CR>', ['<CR>'] = '<CR>', ['<Cr>'] = '<CR>', ['<cR>'] = '<CR>',
+  ['<enter>'] = '<CR>', ['<return>'] = '<CR>',
+  ['<space>'] = '<Space>', ['<SPACE>'] = '<Space>',
+  ['<tab>'] = '<Tab>', ['<TAB>'] = '<Tab>',
+  ['<esc>'] = '<Esc>', ['<ESC>'] = '<Esc>',
+  ['<bs>'] = '<BS>', ['<BS>'] = '<BS>', ['<backspace>'] = '<BS>',
+  ['<del>'] = '<Del>', ['<DEL>'] = '<Del>', ['<delete>'] = '<Del>',
+  ['<insert>'] = '<Insert>', ['<ins>'] = '<Insert>',
+  ['<home>'] = '<Home>', ['<end>'] = '<End>',
+  ['<pageup>'] = '<PageUp>', ['<pagedown>'] = '<PageDown>',
+  ['<up>'] = '<Up>', ['<down>'] = '<Down>', ['<left>'] = '<Left>', ['<right>'] = '<Right>',
+  ['<f1>'] = '<F1>', ['<f2>'] = '<F2>', ['<f3>'] = '<F3>', ['<f4>'] = '<F4>',
+  ['<f5>'] = '<F5>', ['<f6>'] = '<F6>', ['<f7>'] = '<F7>', ['<f8>'] = '<F8>',
+  ['<f9>'] = '<F9>', ['<f10>'] = '<F10>', ['<f11>'] = '<F11>', ['<f12>'] = '<F12>',
+  ['<lt>'] = '<lt>', ['<lt'] = '<lt>',
+  ['<bar>'] = '<Bar>', ['<Bar>'] = '<Bar>',
+  ['<bslash>'] = '<Bslash>', ['<Bslash>'] = '<Bslash>',
+  ['<nul>'] = '<Nul>', ['<Nul>'] = '<Nul>',
+  ['<nop>'] = '<Nop>', ['<Nop>'] = '<Nop>',
+}
+
+vim.api.nvim_replace_termcodes = function(str, from_part, do_lt, special)
+  if type(str) ~= 'string' then
+    return str
+  end
+  -- Expand <leader> and <localleader>
+  local leader = vim.g.mapleader
+  if leader == nil or leader == '' then
+    leader = '\\'
+  end
+  local localleader = vim.g.maplocalleader
+  if localleader == nil or localleader == '' then
+    localleader = '\\'
+  end
+  
+  local result = str:gsub('<[Ll][Ee][Aa][Dd][Ee][Rr]>', leader)
+  result = result:gsub('<[Ll][Oo][Cc][Aa][Ll][Ll][Ee][Aa][Dd][Ee][Rr]>', localleader)
+  
+  -- Normalize control characters and special keys
+  local out = {}
+  local i = 1
+  local len = #result
+  while i <= len do
+    if result:sub(i, i) == '<' then
+      local j = result:find('>', i + 1, true)
+      if j then
+        local token = result:sub(i, j)
+        local token_lower = token:lower()
+        
+        -- Check for <Plug> - keep whole
+        if token_lower == '<plug>' then
+          table.insert(out, token)
+          i = j + 1
+          while i <= len do
+            table.insert(out, result:sub(i, i))
+            i = i + 1
+          end
+          break
+        end
+        
+        -- Control character
+        local ctrl_match = token:match('^<[Cc]%-(.)>$')
+        if ctrl_match then
+          local ch = ctrl_match:upper()
+          table.insert(out, '<C-' .. ch .. '>')
+          i = j + 1
+        else
+          -- Special key
+          local normalized = special_key_names[token_lower]
+          if normalized then
+            table.insert(out, normalized)
+            i = j + 1
+          else
+            -- Modifier keys
+            local mod_match = token:match('^<([SsMmAaDdCc])%-(.+)>$')
+            if mod_match then
+              local mod = mod_match:sub(1, 1):upper()
+              local key = mod_match:sub(2)
+              local key_normalized = special_key_names['<' .. key:lower() .. '>']
+              if key_normalized then
+                key = key_normalized:sub(2, -2)
+              end
+              table.insert(out, '<' .. mod .. '-' .. key .. '>')
+              i = j + 1
+            else
+              table.insert(out, token)
+              i = j + 1
+            end
+          end
+        end
+      else
+        table.insert(out, result:sub(i, i))
+        i = i + 1
+      end
+    else
+      table.insert(out, result:sub(i, i))
+      i = i + 1
+    end
+  end
+  return table.concat(out)
 end
 
 -- Minimal vim.loader: Neovim's own implementation needs far more of the uv
@@ -2191,10 +2417,109 @@ local function find_keymap(list, lhs)
   return nil
 end
 
+-- Normalize a keymap lhs to match Neovim's canonical form.
+-- Rules:
+-- 1. <leader> -> vim.g.mapleader or '\'
+-- 2. <localleader> -> vim.g.maplocalleader or '\'
+-- 3. Control chars: <c-x>, <C-x>, <c-X> -> <C-X>
+-- 4. Special keys normalized to canonical form
+-- 5. <Plug> mappings kept whole (not normalized inside)
+local function normalize_lhs(lhs)
+  if type(lhs) ~= 'string' then
+    return lhs
+  end
+  -- Expand <leader> and <localleader> first
+  local leader = vim.g.mapleader
+  if leader == nil or leader == '' then
+    leader = '\\'
+  end
+  local localleader = vim.g.maplocalleader
+  if localleader == nil or localleader == '' then
+    localleader = '\\'
+  end
+  
+  -- Replace <leader> and <localleader> (case-insensitive)
+  local result = lhs:gsub('<[Ll][Ee][Aa][Dd][Ee][Rr]>', leader)
+  result = result:gsub('<[Ll][Oo][Cc][Aa][Ll][Ll][Ee][Aa][Dd][Ee][Rr]>', localleader)
+  
+  -- Process angle-bracket sequences
+  local out = {}
+  local i = 1
+  local len = #result
+  while i <= len do
+    if result:sub(i, i) == '<' then
+      -- Find closing >
+      local j = result:find('>', i + 1, true)
+      if j then
+        local token = result:sub(i, j)
+        local token_lower = token:lower()
+        
+        -- Check for <Plug> - keep whole, don't normalize inside
+        if token_lower == '<plug>' then
+          -- Keep <Plug> and the rest as-is until end or next <
+          table.insert(out, token)
+          i = j + 1
+          -- Copy rest of string
+          while i <= len do
+            table.insert(out, result:sub(i, i))
+            i = i + 1
+          end
+          break
+        end
+        
+        -- Check for control character: <c-x>, <C-x>, <C-X>, <c-X>
+        local ctrl_match = token:match('^<[Cc]%-(.)>$')
+        if ctrl_match then
+          -- Normalize to <C-X> (uppercase)
+          local ch = ctrl_match:upper()
+          table.insert(out, '<C-' .. ch .. '>')
+          i = j + 1
+        else
+          -- Check for other special keys
+          local normalized = special_key_names[token_lower]
+          if normalized then
+            table.insert(out, normalized)
+            i = j + 1
+          else
+            -- Check for modifier keys: <S-x>, <M-x>, <A-x>, <D-x>, <C-x>
+            local mod_match = token:match('^<([SsMmAaDdCc])%-(.+)>$')
+            if mod_match then
+              local mod = mod_match:sub(1, 1):upper()
+              local key = mod_match:sub(2)
+              -- Normalize the key part if it's a special key
+              local key_normalized = special_key_names['<' .. key:lower() .. '>']
+              if key_normalized then
+                -- Extract just the key name without brackets
+                key = key_normalized:sub(2, -2)
+              end
+              table.insert(out, '<' .. mod .. '-' .. key .. '>')
+              i = j + 1
+            else
+              -- Unknown token, keep as-is
+              table.insert(out, token)
+              i = j + 1
+            end
+          end
+        end
+      else
+        -- No closing >, keep as-is
+        table.insert(out, result:sub(i, i))
+        i = i + 1
+      end
+    else
+      table.insert(out, result:sub(i, i))
+      i = i + 1
+    end
+  end
+  return table.concat(out)
+end
+
 local function make_keymap(mode, lhs, rhs, opts)
   opts = opts or {}
+  local normalized = normalize_lhs(lhs)
   local map = {
-    lhs = lhs,
+    lhs = normalized,
+    lhsraw = lhs,
     mode = norm_mode(mode),
     noremap = (opts.noremap == true or opts.remap ~= true) and 1 or 0,
     silent = opts.silent and 1 or 0,
@@ -2203,6 +2528,16 @@ local function make_keymap(mode, lhs, rhs, opts)
     rhs = type(rhs) == 'function' and '' or tostring(rhs or ''),
   }
   return map
+end
+
+local function find_keymap(list, lhs)
+  local normalized = normalize_lhs(lhs)
+  for _, map in ipairs(list) do
+    if map.lhs == normalized then
+      return map
+    end
+  end
+  return nil
 end
 
 vim.api.nvim_set_keymap = function(mode, lhs, rhs, opts)
@@ -2223,7 +2558,22 @@ vim.api.nvim_get_keymap = function(mode)
   local list = keymaps[norm_mode(mode)] or {}
   local copy = {}
   for i, map in ipairs(list) do
-    copy[i] = map
+    -- Return a copy with normalized lhs
+    copy[i] = {
+      lhs = map.lhs,
+      mode = map.mode,
+      noremap = map.noremap,
+      silent = map.silent,
+      desc = map.desc,
+      callback = map.callback,
+      rhs = map.rhs,
+      buffer = 0,
+      nowait = map.nowait or 0,
+      expr = map.expr or 0,
+      script = 0,
+      sid = 0,
+      lnum = 0,
+    }
   end
   return copy
 end
@@ -2231,8 +2581,9 @@ end
 vim.api.nvim_del_keymap = function(mode, lhs)
   local list = keymaps[norm_mode(mode)]
   if list then
+    local normalized = normalize_lhs(lhs)
     for i, map in ipairs(list) do
-      if map.lhs == lhs then
+      if map.lhs == normalized then
         table.remove(list, i)
         return
       end
@@ -2271,14 +2622,35 @@ end
 
 vim.api.nvim_buf_get_keymap = function(buf, mode)
   buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
-  return buf_keymap_list(buf, mode)
+  local list = buf_keymap_list(buf, mode)
+  local copy = {}
+  for i, map in ipairs(list) do
+    -- Return a copy with normalized lhs
+    copy[i] = {
+      lhs = map.lhs,
+      mode = map.mode,
+      noremap = map.noremap,
+      silent = map.silent,
+      desc = map.desc,
+      callback = map.callback,
+      rhs = map.rhs,
+      buffer = buf,
+      nowait = map.nowait or 0,
+      expr = map.expr or 0,
+      script = 0,
+      sid = 0,
+      lnum = 0,
+    }
+  end
+  return copy
 end
 
 vim.api.nvim_buf_del_keymap = function(buf, mode, lhs)
   buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
   local list = buf_keymap_list(buf, mode)
+  local normalized = normalize_lhs(lhs)
   for i, map in ipairs(list) do
-    if map.lhs == lhs then
+    if map.lhs == normalized then
       table.remove(list, i)
       return
     end
