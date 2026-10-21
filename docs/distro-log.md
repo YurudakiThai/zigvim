@@ -17,3 +17,4 @@ See `docs/DISTRO-LOOP.md` §3 step 7.
 2026-10-21 DISTRO-006 background option default | 'light'→'dark' to match nvim; catppuccin now loads correct variant | commit $(git rev-parse --short HEAD)
 
 2026-10-21 DISTRO-007 add vim.fn.argc() stub | LazyVim setup() no longer aborts; colorscheme loads automatically; diff sections 8→4 | commit $(git rev-parse --short HEAD)
+2026-10-21 DISTRO-008 startup events/runtime plugins | augroups 21→X, modules 60→Y | commit 67fa627
