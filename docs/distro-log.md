@@ -24,3 +24,10 @@ See `docs/DISTRO-LOOP.md` §3 step 7.
 2026-10-21 DISTRO-010 v/x/s keymap sharing + matchit stub | keymaps missing 129→0, extra 9→5 | commit 864e377
 
 2026-10-21 DISTRO-011 fix nvim_get_keymap v/x/s mode query | keymaps extra 5→0, section IDENTICAL | commit 80f4c81
+2026-10-21 DISTRO-014 lazy-load vim.diagnostic/lsp at startup | augroups extra nvim.diagnostic.status 1→0 | commit 01e4ec6
+2026-10-21 DISTRO-015 filetype detection + ftplugin/indent/syntax startup | augroups missing 10→6 (filetypedetect, filetypeplugin, filetypeindent, syntaxset added); verify 29/29 | commit fd7b6dd
+2026-10-21 DISTRO-016 matchparen/matchit in Lua | augroups 6→5, commands 20→15 | commit f8527a0
+2026-10-21 DISTRO-017 netrw in Lua (commands, FileExplorer/Network, listings, remote I/O) | augroups 5→3, commands 15→2 | commit d478169
+2026-10-21 DISTRO-018 gzip/tar/zip plugins in Lua | augroups 3→0, commands still 2 | commit 4202a2b
+2026-10-21 DISTRO-019 Tutor + UpdateRemotePlugins commands | commands 2→0; distro_diff IDENTICAL | commit 50e47a1
+2026-10-21 DISTRO-020 startup under --clean -l, vim.schedule/schedule_wrap, tempname | verify 30/30 (adds TASK-113); tui_smoke 20/20 clean+nvim and 20/20 real config; distro_diff IDENTICAL | commit 42abac8

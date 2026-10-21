@@ -63,8 +63,9 @@ reading.
 
 - Neovim runtime: `runtime/plugin/{matchparen,tutor,rplugin}.vim`,
   `runtime/pack/dist/opt/{netrw,matchit}`, `runtime/plugin/{gzip,tarPlugin,zipPlugin}.vim`
-- Implementation: `runtime/lua/vim/_netrw.lua`, `_matchparen.lua`,
-  `_matchit_stub.lua`, `_archives.lua`, `_tutor.lua`, `_remote.lua`
+- Implementation: `src/lua/vim/_netrw.lua`, `_matchparen.lua`,
+  `_matchit_stub.lua`, `_archives.lua`, `_tutor.lua`, `_remote.lua` (embedded
+  into the binary; see `registerEmbeddedModules` in `src/main.zig`)
 - `docs/DISTRO-LOOP.md` section 6 (stub register)
 
 ---

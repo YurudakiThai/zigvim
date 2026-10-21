@@ -4749,7 +4749,28 @@ if not ok_defaults then
   io.stderr:write('Warning: failed to load vim._core.defaults: ' .. tostring(err_defaults) .. '\n')
 end
 
--- Runtime plugins that Neovim ships as Vimscript, reimplemented in Lua.
+-- Runtime plugins that Neovim ships as Vimscript are reimplemented in Lua
+-- under src/lua/ and embedded in the binary. Register a package searcher for
+-- them before the requires below.
+do
+  local embedded = _G._ZIGVIM_EMBEDDED
+  if type(embedded) == 'table' then
+    local searchers = package.loaders or package.searchers
+    table.insert(searchers, 1, function(name)
+      local source = embedded[name]
+      if not source then
+        return nil
+      end
+      local chunk, err = loadstring(source, '@' .. name)
+      if not chunk then
+        return '\n\t' .. tostring(err)
+      end
+      return chunk
+    end)
+    _G._ZIGVIM_EMBEDDED = nil
+  end
+end
+
 -- matchit.vim: mappings plus the MatchEnable/MatchDisable/MatchDebug commands.
 local ok_matchit, matchit_stub = pcall(require, 'vim._matchit_stub')
 if ok_matchit then

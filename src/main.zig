@@ -280,6 +280,7 @@ pub fn main(init: std.process.Init) !void {
 
     c.luaL_openlibs(L);
     g_L = L;
+    registerEmbeddedModules(L);
     try registerVimGlobal(L);
     try loadPrelude(L);
     try loadTui(L);
@@ -555,6 +556,29 @@ fn registerVimGlobal(L: *c.lua_State) !void {
     c.lua_setfield(L, -2, "json");
 
     c.lua_setglobal(L, "vim");
+}
+
+// Lua reimplementations of Neovim's Vimscript runtime plugins. They live in
+// src/lua/ (not runtime/lua/, which is fetched and gitignored) and are
+// embedded so a fresh checkout has them without running fetch-runtime.sh.
+const embedded_lua_modules = [_]struct { name: [:0]const u8, source: [:0]const u8 }{
+    .{ .name = "vim._matchit_stub", .source = @embedFile("lua/vim/_matchit_stub.lua") },
+    .{ .name = "vim._matchparen", .source = @embedFile("lua/vim/_matchparen.lua") },
+    .{ .name = "vim._netrw", .source = @embedFile("lua/vim/_netrw.lua") },
+    .{ .name = "vim._archives", .source = @embedFile("lua/vim/_archives.lua") },
+    .{ .name = "vim._tutor", .source = @embedFile("lua/vim/_tutor.lua") },
+    .{ .name = "vim._remote", .source = @embedFile("lua/vim/_remote.lua") },
+};
+
+/// Expose the embedded modules as a global table that prelude.lua turns into a
+/// package searcher. Must run after luaL_openlibs and before loadPrelude.
+fn registerEmbeddedModules(L: *c.lua_State) void {
+    c.lua_newtable(L);
+    for (embedded_lua_modules) |module| {
+        c.lua_pushlstring(L, module.source.ptr, module.source.len);
+        c.lua_setfield(L, -2, module.name.ptr);
+    }
+    c.lua_setglobal(L, "_ZIGVIM_EMBEDDED");
 }
 
 fn loadPrelude(L: *c.lua_State) !void {

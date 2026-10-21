@@ -24,9 +24,10 @@ cd ~/zigvim
 ## 📖 Documentation
 
 - **AGENTS.md** — protocol for AI coding agents (copy to `.cursorrules` or `CLAUDE.md`)
+- **docs/DISTRO-LOOP.md** — the measure → fix → verify loop for Neovim distributions
 - **docs/differential-test-harness.md** — full design report
 - **docs/vibe-coding-playbook.md** — vibe coding workflow guide
-- **tasks/** — task cards (TASK-001 through TASK-012)
+- **tasks/** — task cards (TASK-001 through TASK-113)
 - **specs/api-surface.md** — machine-readable API contract
 
 ## 🛠️ Development
@@ -48,8 +49,11 @@ See `docs/vibe-coding-playbook.md` for the complete vibe coding workflow.
 | Editor Core | TASK-006 to TASK-008 | ✅ Complete |
 | Options & Autocmds | TASK-009 to TASK-012 | ✅ Complete |
 | Infrastructure | TASK-INFRA-001 to TASK-INFRA-005 | ✅ Complete |
+| LazyVim distro | DISTRO-000 to DISTRO-020 (`docs/DISTRO-LOOP.md`) | ✅ `distro_diff` IDENTICAL |
 
-Run `./scripts/progress.sh` for the live pass/fail report.
+Run `./scripts/progress.sh` for the live pass/fail report. The distribution gates are:
+`python3 scripts/distro_diff.py` (IDENTICAL), `./scripts/verify.sh all` (30/30),
+`python3 scripts/tui_smoke.py --clean --nvim` and `python3 scripts/tui_smoke.py` (20/20 each).
 
 ## 📜 License
 
