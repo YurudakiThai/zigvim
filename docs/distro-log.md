@@ -33,3 +33,6 @@ See `docs/DISTRO-LOOP.md` §3 step 7.
 2026-10-21 DISTRO-020 startup under --clean -l, vim.schedule/schedule_wrap, tempname | verify 30/30 (adds TASK-113); tui_smoke 20/20 clean+nvim and 20/20 real config; distro_diff IDENTICAL | commit 42abac8
 2026-10-21 DISTRO-021 move runtime plugin shims to tracked src/lua and embed them | gates re-run after the move: distro_diff IDENTICAL, verify 30/30, tui_smoke 20/20 both modes | commit 23a9c5c
 2026-10-22 DISTRO-114 keymap normalization + write_file empty-line | extra_keymaps: 162→0, missing_keymaps: 291→0 | commit 5709464
+
+2026-10-22 DISTRO-115 defer netrw/tutor setup to respect g:loaded_* guards | netrw extra commands: 14→1; netrw augroups: gzip/tar/zip/Network remain | commit e0fe93f
+2026-10-22 DISTRO-116 winsaveview/winrestview + feedkeys | verify 32/32 (adds TASK-115) | commit pending

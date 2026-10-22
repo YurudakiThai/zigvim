@@ -700,10 +700,69 @@ local function getkey()
       return '<Esc>'
     end
   end
-  S.msg = ''
-  S.msg_err = false
+  if not S.from_inject then
+    S.msg = '' -- keep an error shown by a failed mapping while its fallback keys run
+    S.msg_err = false
+  end
   S.cur_keys[#S.cur_keys + 1] = k
   return k
+end
+
+-- Raw key bytes (what nvim_replace_termcodes returns) -> TUI key tokens.
+-- shortcut: only <C-x>, arrows/Home/End/PageUp/PageDown/Del/BS and <Plug>(name)
+-- survive; other modifiers and special keys are dropped.
+local RAW_SPECIAL = {
+  ku = '<Up>', kd = '<Down>', kl = '<Left>', kr = '<Right>', kb = '<BS>', kD = '<Del>',
+  kh = '<Home>', ['@7'] = '<End>', kP = '<PageUp>', kN = '<PageDown>',
+}
+
+local function raw_to_tokens(raw)
+  local out, i, n = {}, 1, #raw
+  while i <= n do
+    local b = raw:byte(i)
+    if b == 0x80 and i + 2 <= n then
+      local b2, b3 = raw:byte(i + 1), raw:byte(i + 2)
+      if b2 == 0xfd and b3 == 0x53 then
+        local name = raw:match('^%b()', i + 3) or ''
+        out[#out + 1] = '<Plug>' .. name
+        i = i + 3 + #name
+      elseif b2 == 0xfd then
+        i = i + 3 -- <Ignore> and other extras type nothing
+      elseif b2 == 0xfc then
+        local nxt = raw:sub(i + 3, i + 3)
+        if b3 == 0x04 and nxt:match('^%a$') then
+          out[#out + 1] = '<C-' .. nxt:lower() .. '>'
+        end
+        i = i + 4
+      else
+        out[#out + 1] = RAW_SPECIAL[string.char(b2, b3)]
+        i = i + 3
+      end
+    elseif b < 32 or b == 127 then
+      out[#out + 1] = control_key(b) or '<Nop>'
+      i = i + 1
+    else
+      local len = (b >= 0xF0 and 4) or (b >= 0xE0 and 3) or (b >= 0xC0 and 2) or 1
+      out[#out + 1] = raw:sub(i, i + len - 1)
+      i = i + len
+    end
+  end
+  return out
+end
+
+-- nvim_feedkeys: 'i' inserts before pending input, 'n' means do not remap.
+vim._tui_feed = function(raw, mode)
+  local tokens = raw_to_tokens(raw)
+  local target = mode:find('n', 1, true) and S.inject or S.queue
+  if mode:find('i', 1, true) then
+    for j = #tokens, 1, -1 do
+      table.insert(target, 1, tokens[j])
+    end
+  else
+    for _, tok in ipairs(tokens) do
+      target[#target + 1] = tok
+    end
+  end
 end
 
 -- Implemented after ex() because mappings may run Ex commands.
@@ -1940,9 +1999,9 @@ local function with_api_cursor(fn)
   end
   if not ok then
     err(clean_error(res))
-    return nil
+    return false
   end
-  return res
+  return true, res
 end
 
 local function fire_map(entry, typed, depth)
@@ -1950,10 +2009,11 @@ local function fire_map(entry, typed, depth)
     table.remove(S.cur_keys) -- the mapping replaces the keys that were typed
   end
   local map = entry.map
-  local rhs
+  local rhs, failed
   if map.callback then
-    local res = with_api_cursor(map.callback)
-    if map.expr == 1 and type(res) == 'string' then
+    local ok, res = with_api_cursor(map.callback)
+    failed = not ok
+    if ok and map.expr == 1 and type(res) == 'string' then
       rhs = res
     end
   else
@@ -1963,9 +2023,11 @@ local function fire_map(entry, typed, depth)
     local cmd, rest = rhs:match('^<[Cc][Mm][Dd]>(.-)<[Cc][Rr]>(.*)$')
     if cmd then
       local mode = S.mode
+      S.msg_err = false
       with_api_cursor(function()
         ex(cmd)
       end)
+      failed = failed or S.msg_err
       S.mode = mode
       rhs = rest
     end
@@ -1976,6 +2038,14 @@ local function fire_map(entry, typed, depth)
       end
     else
       queue_front(tokens)
+    end
+  end
+  if failed then
+    -- shortcut: a mapping that errors (usually a plugin calling an API zigvim lacks)
+    -- falls back to the built-in meaning of the typed keys so editing keeps working;
+    -- the error stays on the message line. Upgrade when plugin coverage is complete.
+    for i = #typed, 1, -1 do
+      table.insert(S.inject, 1, typed[i])
     end
   end
   if S.quit then

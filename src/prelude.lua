@@ -1302,6 +1302,41 @@ function vim.fn.getenv(name)
   return value
 end
 
+-- shortcut: topline/leftcol are not tracked by the API layer, so the view only carries
+-- the cursor. Upgrade when windows expose scroll state.
+function vim.fn.winsaveview()
+  local pos = vim.api.nvim_win_get_cursor(0)
+  return {
+    lnum = pos[1],
+    col = pos[2],
+    coladd = 0,
+    curswant = pos[2],
+    topline = 1,
+    topfill = 0,
+    leftcol = 0,
+    skipcol = 0,
+  }
+end
+
+function vim.fn.winrestview(view)
+  if type(view) == 'table' and view.lnum then
+    vim.api.nvim_win_set_cursor(0, { view.lnum, view.col or 0 })
+  end
+end
+
+-- Keys fed while the TUI runs go to its typeahead (vim._tui_feed); with no UI
+-- (headless) there is no input loop to receive them, so they are dropped.
+function vim.api.nvim_feedkeys(keys, mode, _escape_ks)
+  if vim._tui_feed then
+    vim._tui_feed(keys, mode or '')
+  end
+end
+
+function vim.fn.feedkeys(keys, mode)
+  vim.api.nvim_feedkeys(keys, mode or '', false)
+  return 0
+end
+
 function vim.fn.getftime(path)
   local stat = vim.uv.fs_stat(path)
   return stat and stat.mtime and stat.mtime.sec or -1
