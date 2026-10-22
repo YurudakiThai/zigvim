@@ -19,6 +19,8 @@ local S = {
   cmdtext = '',
   quit = false,
   queue = {},
+  inject = {}, -- keys fed by noremap mappings; never mapped again
+  from_inject = false,
   rbuf = '',
   reg = { text = { '' }, linewise = false },
   undo = {},
@@ -661,7 +663,9 @@ local function parse_input(final)
 end
 
 local function getkey()
-  local k = table.remove(S.queue, 1)
+  local k = table.remove(S.inject, 1)
+  S.from_inject = k ~= nil
+  k = k or table.remove(S.queue, 1)
   if not k then
     draw()
     local last_size = S.rows * 1000 + S.cols
@@ -700,6 +704,12 @@ local function getkey()
   S.msg_err = false
   S.cur_keys[#S.cur_keys + 1] = k
   return k
+end
+
+-- Implemented after ex() because mappings may run Ex commands.
+local map_key
+local function getkey_cmd(depth)
+  return map_key(getkey(), depth or 0)
 end
 
 local function queue_front(keys)
@@ -1684,7 +1694,7 @@ end
 function insert_mode()
   S.mode = 'i'
   while not S.quit do
-    local k = getkey()
+    local k = getkey_cmd()
     if k == '<Esc>' or k == '<C-c>' then
       break
     elseif k == '<CR>' then
@@ -1828,6 +1838,221 @@ local function ex(line)
   end
 end
 
+-- ---------------------------------------------------------- user mappings
+-- Applies :map / vim.keymap.set mappings to typed keys. Only the first key of a
+-- normal/visual command and every key in insert mode are mapped, so keys that are
+-- arguments of d, f, r, ... are never remapped.
+-- shortcut: no operator-pending or command-line maps; only <C-x> modifiers
+-- (<M-x>, <S-x>, F-keys make a map unsupported and it is skipped); <expr> needs a
+-- Lua callback. Upgrade when the TUI grows a real key parser with modifiers.
+
+local NAMED_KEYS = {
+  cr = '<CR>', enter = '<CR>', ['return'] = '<CR>', esc = '<Esc>', tab = '<Tab>', bs = '<BS>',
+  del = '<Del>', up = '<Up>', down = '<Down>', left = '<Left>', right = '<Right>', home = '<Home>',
+  ['end'] = '<End>', pageup = '<PageUp>', pagedown = '<PageDown>', space = ' ', lt = '<',
+  bar = '|', bslash = '\\',
+}
+
+-- Key notation -> TUI key tokens. Returns nil when the sequence uses a key the
+-- TUI cannot produce.
+local function tokenize(text, out)
+  out = out or {}
+  local i, n = 1, #text
+  while i <= n do
+    local plug = text:match('^<[Pp][Ll][Uu][Gg]>%b()', i)
+    local name = text:match('^<([^<>]+)>', i)
+    if plug then
+      out[#out + 1] = plug
+      i = i + #plug
+    elseif name then
+      local lower = name:lower()
+      if lower == 'leader' or lower == 'localleader' then
+        local leader = lower == 'leader' and vim.g.mapleader or vim.g.maplocalleader
+        if not tokenize((leader and leader ~= '') and leader or '\\', out) then
+          return nil
+        end
+      elseif lower == 'nop' then
+        -- produces no keys
+      elseif NAMED_KEYS[lower] then
+        out[#out + 1] = NAMED_KEYS[lower]
+      elseif lower:match('^c%-%a$') then
+        out[#out + 1] = '<C-' .. lower:sub(3) .. '>'
+      else
+        return nil
+      end
+      i = i + #name + 2
+    else
+      local ch = text:match('^[%z\1-\127\194-\244][\128-\191]*', i)
+      out[#out + 1] = ch
+      i = i + #ch
+    end
+  end
+  return out
+end
+
+local function collect_maps(mode)
+  local list = {}
+  local function add(maps)
+    for _, m in ipairs(maps) do
+      local tokens = tokenize(m.lhs)
+      if tokens and #tokens > 0 then
+        list[#list + 1] = { tokens = tokens, map = m }
+      end
+    end
+  end
+  -- Buffer-local mappings come first so they win over global ones.
+  pcall(function()
+    add(api.nvim_buf_get_keymap(0, mode))
+  end)
+  pcall(function()
+    add(api.nvim_get_keymap(mode))
+  end)
+  return list
+end
+
+local function getkey_timeout(ms)
+  local k = table.remove(S.queue, 1)
+  if k then
+    return k
+  end
+  local data = vim._tty_read(ms)
+  if data == nil then
+    S.quit = true
+    return nil
+  end
+  if data == '' then
+    return nil
+  end
+  S.rbuf = S.rbuf .. data
+  parse_input(true)
+  return table.remove(S.queue, 1)
+end
+
+-- Callbacks and :commands see the buffer/cursor through the Neovim API, so give
+-- them the TUI cursor first and take back whatever they moved.
+local function with_api_cursor(fn)
+  pcall(api.nvim_win_set_cursor, 0, { S.row, S.col })
+  local ok, res = pcall(fn)
+  local pos_ok, pos = pcall(api.nvim_win_get_cursor, 0)
+  if pos_ok then
+    S.row, S.col = pos[1], pos[2]
+    clamp()
+  end
+  if not ok then
+    err(clean_error(res))
+    return nil
+  end
+  return res
+end
+
+local function fire_map(entry, typed, depth)
+  for _ = 1, #typed do
+    table.remove(S.cur_keys) -- the mapping replaces the keys that were typed
+  end
+  local map = entry.map
+  local rhs
+  if map.callback then
+    local res = with_api_cursor(map.callback)
+    if map.expr == 1 and type(res) == 'string' then
+      rhs = res
+    end
+  else
+    rhs = map.rhs
+  end
+  if rhs and rhs ~= '' then
+    local cmd, rest = rhs:match('^<[Cc][Mm][Dd]>(.-)<[Cc][Rr]>(.*)$')
+    if cmd then
+      local mode = S.mode
+      with_api_cursor(function()
+        ex(cmd)
+      end)
+      S.mode = mode
+      rhs = rest
+    end
+    local tokens = tokenize(rhs) or {}
+    if map.noremap == 1 then
+      for i = #tokens, 1, -1 do
+        table.insert(S.inject, 1, tokens[i])
+      end
+    else
+      queue_front(tokens)
+    end
+  end
+  if S.quit then
+    return '<Esc>'
+  end
+  if depth >= 100 then
+    err('E223: recursive mapping')
+    return '<Esc>'
+  end
+  return getkey_cmd(depth + 1)
+end
+
+map_key = function(first, depth)
+  if S.from_inject then
+    return first
+  end
+  local mode = (S.mode == 'v' or S.mode == 'V') and 'x' or S.mode
+  if mode ~= 'n' and mode ~= 'i' and mode ~= 'x' then
+    return first
+  end
+  local maps = collect_maps(mode)
+  if #maps == 0 then
+    return first
+  end
+  local pending = { first }
+  local best, best_len -- longest complete mapping seen so far
+  while true do
+    local exact, longer
+    for _, entry in ipairs(maps) do
+      local t = entry.tokens
+      if #t >= #pending then
+        local same = true
+        for i = 1, #pending do
+          if t[i] ~= pending[i] then
+            same = false
+            break
+          end
+        end
+        if same then
+          if #t == #pending then
+            exact = exact or entry
+          else
+            longer = true
+          end
+        end
+      end
+    end
+    if exact then
+      best, best_len = exact, #pending
+    end
+    local nxt
+    if longer then
+      nxt = getkey_timeout(tonumber(vim.o.timeoutlen) or 1000)
+    end
+    if nxt then
+      S.cur_keys[#S.cur_keys + 1] = nxt
+      pending[#pending + 1] = nxt
+    else
+      -- Dead end or timeout: use the longest complete mapping, if any, and give
+      -- the keys after it back to be typed again.
+      local used = best_len or 1
+      for i = #pending, used + 1, -1 do
+        table.insert(S.queue, 1, pending[i])
+        table.remove(S.cur_keys)
+      end
+      if best then
+        local typed = {}
+        for i = 1, used do
+          typed[i] = pending[i]
+        end
+        return fire_map(best, typed, depth)
+      end
+      return pending[1]
+    end
+  end
+end
+
 local function cmdline(prefix)
   S.cmdtype = prefix
   S.cmdtext = ''
@@ -1964,7 +2189,7 @@ local function visual_command(k, count)
 end
 
 local function normal_command()
-  local k = getkey()
+  local k = getkey_cmd()
   local count
   if k:match('^[1-9]$') then
     count = tonumber(k)

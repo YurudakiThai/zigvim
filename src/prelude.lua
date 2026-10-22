@@ -1302,6 +1302,16 @@ function vim.fn.getenv(name)
   return value
 end
 
+function vim.fn.getftime(path)
+  local stat = vim.uv.fs_stat(path)
+  return stat and stat.mtime and stat.mtime.sec or -1
+end
+
+function vim.fn.getfsize(path)
+  local stat = vim.uv.fs_stat(path)
+  return stat and stat.size or -1
+end
+
 function vim.fn.getftype(path)
   return vim._path_type(tostring(path))
 end
@@ -1363,8 +1373,16 @@ local function write_file(path, lines)
   if not f then
     error('E212: Can\'t open file for writing: ' .. path)
   end
+  -- Neovim writes a trailing newline when 'endofline' is set (default true).
+  -- For a truly new, never-modified empty buffer Neovim writes 0 bytes, but
+  -- distinguishing that requires tracking buffer-creation state.  The practical
+  -- rule used by the test suite and by most workflows: always emit the final
+  -- newline so that 'a\n' with the 'a' deleted still writes '\n'.
   local body
-  if #lines == 1 and lines[1] == '' then
+  if #lines == 0 then
+    body = ''
+  elseif #lines == 1 and lines[1] == '' and not vim.bo.modified then
+    -- Truly empty, never-modified buffer: write 0 bytes (matches nvim :enew + :w).
     body = ''
   else
     body = table.concat(lines, '\n') .. '\n'
@@ -1602,6 +1620,30 @@ local function exec_cmd(cmd)
       error("E484: Can't open file " .. path, 0)
     end
     -- Vimscript files are not supported yet and are skipped.
+  elseif name == 'map' or name == 'nmap' or name == 'vmap' or name == 'xmap'
+    or name == 'omap' or name == 'imap' or name == 'cmap' or name == 'tmap'
+    or name == 'noremap' or name == 'nnoremap' or name == 'vnoremap'
+    or name == 'xnoremap' or name == 'onoremap' or name == 'inoremap'
+    or name == 'cnoremap' or name == 'tnoremap' then
+    -- Parse mapping commands: map, nmap, nnoremap, etc.
+    local mode_map = {
+      map = '', nmap = 'n', vmap = 'v', xmap = 'x',
+      omap = 'o', imap = 'i', cmap = 'c', tmap = 't',
+      noremap = '', nnoremap = 'n', vnoremap = 'v', xnoremap = 'x',
+      onoremap = 'o', inoremap = 'i', cnoremap = 'c', tnoremap = 't',
+    }
+    local noremap = name:match('noremap') ~= nil
+    local mode = mode_map[name] or ''
+    local lhs, rhs = rest:match('^(%S+)%s+(.*)$')
+    if lhs and rhs then
+      vim.api.nvim_set_keymap(mode, lhs, rhs, { noremap = noremap, silent = false })
+    end
+  elseif name == 'unmap' or name == 'nunmap' or name == 'vunmap' or name == 'xunmap'
+    or name == 'ounmap' or name == 'iunmap' or name == 'cunmap' or name == 'tunmap'
+    or name == 'mapclear' or name == 'nmapclear' or name == 'vmapclear'
+    or name == 'xmapclear' or name == 'omapclear' or name == 'imapclear'
+    or name == 'cmapclear' or name == 'tmapclear' then
+    -- Unmap commands: accepted but not fully implemented (would need to iterate and delete)
   elseif name == 'augroup' or name == 'aug' or name == 'packadd' or name == 'filetype'
     or name == 'syntax' or name == 'syn' or name == 'highlight' or name == 'hi'
     or name == 'highlight!' or name == 'hi!'
@@ -2091,6 +2133,23 @@ vim.uv.new_check = function()
     return false
   end
   return handle
+end
+-- luv returns times as { sec, nsec } tables; the Zig core returns only a number.
+-- shortcut: atime/ctime/birthtime reuse mtime, and mode/uid/ino are absent; upgrade
+-- when the core exposes the full struct stat.
+do
+  local core_stat = vim.uv.fs_stat
+  vim.uv.fs_stat = function(path)
+    local st = core_stat(path)
+    if st and type(st.mtime) == 'number' then
+      local sec = st.mtime
+      st.mtime = { sec = sec, nsec = 0 }
+      st.atime = { sec = sec, nsec = 0 }
+      st.ctime = { sec = sec, nsec = 0 }
+      st.birthtime = { sec = sec, nsec = 0 }
+    end
+    return st
+  end
 end
 vim.uv.fs_lstat = vim.uv.fs_stat
 vim.uv.available_parallelism = function()
@@ -2742,7 +2801,7 @@ local function make_keymap(mode, lhs, rhs, opts)
     lhs = normalized,
     lhsraw = lhs,
     mode = norm_mode(mode),
-    noremap = (opts.noremap == true or opts.remap ~= true) and 1 or 0,
+    noremap = opts.noremap == true and 1 or 0,
     silent = opts.silent and 1 or 0,
     desc = opts.desc,
     callback = type(rhs) == 'function' and rhs or nil,
@@ -3721,6 +3780,38 @@ do
         rawset(t, k, lib)
         return lib
       end
+    end
+    -- shortcut: no tree-sitter C library, so the real vim.treesitter cannot load;
+    -- behave like Neovim with no parsers installed. Upgrade when parsers can run.
+    if k == 'treesitter' then
+      local none = function() end
+      local stub = {
+        highlighter = { active = {} },
+        start = none,
+        stop = none,
+        get_parser = function()
+          return nil, 'no parser available'
+        end,
+        get_node = none,
+        get_captures_at_pos = function()
+          return {}
+        end,
+        foldexpr = function()
+          return '0'
+        end,
+        language = {
+          add = function()
+            return false
+          end,
+          get_lang = function(ft)
+            return ft
+          end,
+          register = none,
+        },
+        query = { get = none, parse = none, set = none },
+      }
+      rawset(t, k, stub)
+      return stub
     end
     if old_index then
       return old_index(t, k)

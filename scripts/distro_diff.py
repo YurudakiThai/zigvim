@@ -46,7 +46,9 @@ def clone_tree(src: Path, dst: Path) -> None:
 
 
 def make_sandbox(config: Path, data: Path, tmp: Path) -> dict:
-    # Use HOME instead of XDG_* variables to avoid zigvim hang bug with XDG paths
+    # Both editors share this HOME: nvim installs missing plugins into the
+    # sandbox data dir first, then zigvim must see exactly those plugins.
+    # Only state/cache are split per editor (see run_editor).
     sandbox_home = tmp / "home"
     sandbox_home.mkdir(parents=True)
     shutil.copytree(config, sandbox_home / ".config" / "nvim", symlinks=True, ignore=shutil.ignore_patterns(".git"))
@@ -63,16 +65,21 @@ def make_sandbox(config: Path, data: Path, tmp: Path) -> dict:
 
 
 def run_editor(name: str, binary: str, env: dict, out_path: Path, timeout: int) -> dict:
-    # Own home per editor to isolate cache/state and avoid zigvim XDG hang bug
+    # Keep the sandbox HOME (config + plugin data) shared so plugins nvim
+    # installs are visible to zigvim, but isolate ephemeral state and cache so
+    # the two runs cannot observe each other's shada/lazy state.
     scratch = out_path.parent
-    editor_home = scratch / f"home-{name}"
-    editor_home.mkdir(exist_ok=True)
-    # Copy minimal structure
-    (editor_home / ".local" / "share" / "nvim").mkdir(parents=True, exist_ok=True)
-    (editor_home / ".local" / "state" / "nvim").mkdir(parents=True, exist_ok=True)
-    (editor_home / ".cache" / "nvim").mkdir(parents=True, exist_ok=True)
-    
-    env = dict(env, HOME=str(editor_home), PROBE_OUT=str(out_path))
+    editor_state = scratch / f"state-{name}"
+    editor_cache = scratch / f"cache-{name}"
+    editor_state.mkdir(exist_ok=True)
+    editor_cache.mkdir(exist_ok=True)
+
+    env = dict(
+        env,
+        XDG_STATE_HOME=str(editor_state),
+        XDG_CACHE_HOME=str(editor_cache),
+        PROBE_OUT=str(out_path),
+    )
     cmd = [binary, "--headless", "-c", f"lua dofile('{PROBE}')", "-c", "qa!"]
     started = time.time()
     try:

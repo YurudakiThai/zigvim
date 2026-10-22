@@ -32,7 +32,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ESC = b"\x1b"
 
-# name: (initial text, keystrokes, expected text after exit)
+# name: (initial text, keystrokes, expected text after exit[, extra command-line args])
 CASES = {
     "dd": ("a\nb\nc\n", [b"dd", b":w\r", b":q\r"], "b\nc\n"),
     "dd then undo": ("a\nb\nc\n", [b"dd", b"u", b":w\r", b":q\r"], "a\nb\nc\n"),
@@ -55,6 +55,26 @@ CASES = {
     ">> indent": ("a\n", [b":set noexpandtab shiftwidth=8 tabstop=8\r", b">>", b":wq\r"], "\ta\n"),
     "p after dd": ("a\nb\n", [b"dd", b"p", b":wq\r"], "b\na\n"),
     "visual line d": ("a\nb\nc\n", [b"V", b"j", b"d", b":wq\r"], "c\n"),
+    # User mappings (-c runs after init.lua, so these also work with a distro loaded).
+    "map nnoremap": ("a\nb\n", [b"Q", b":wq\r"], "b\n", ["-c", "nnoremap Q dd"]),
+    "map remap chain": ("a\nb\n", [b"Q", b":wq\r"], "b\n", ["-c", "nmap Q W", "-c", "nnoremap W dd"]),
+    "map insert jk": ("a\n", [b"ix", b"jk", b":wq\r"], "xa\n", ["-c", "inoremap jk <Esc>"]),
+    "map prefix falls back": ("a\n", [b"ijx", ESC, b":wq\r"], "jxa\n", ["-c", "inoremap jk <Esc>"]),
+    "map lua callback": (
+        "a\nb\n",
+        [b"Q", b":wq\r"],
+        "b\n",
+        ["-c", "lua vim.keymap.set('n','Q',function() vim.api.nvim_buf_set_lines(0,0,1,false,{}) end)"],
+    ),
+    "map leader": (
+        "a\nb\n",
+        [b" x", b":wq\r"],
+        "b\n",
+        ["-c", "lua vim.g.mapleader=' '", "-c", "nnoremap <leader>x dd"],
+    ),
+    "map <C-s> to :w": ("a\n", [b"x", b"\x13", b":q!\r"], "\n", ["-c", "nnoremap <C-s> :w<CR>"]),
+    "map <Cmd>": ("a\n", [b"x", b"\x13", b":q!\r"], "\n", ["-c", "nnoremap <C-s> <Cmd>w<CR>"]),
+    "map visual": ("abc\n", [b"v", b"l", b"Q", b":wq\r"], "c\n", ["-c", "xnoremap Q d"]),
 }
 
 
@@ -121,11 +141,13 @@ def main() -> int:
 
     failed = 0
     selected = {k: v for k, v in CASES.items() if args.k in k}
-    for name, (text, keys, want) in selected.items():
-        got, running = run_session(zig_argv, text, keys)
+    for name, case in selected.items():
+        text, keys, want = case[:3]
+        extra = case[3] if len(case) > 3 else []
+        got, running = run_session(zig_argv + extra, text, keys)
         notes = []
         if args.nvim:
-            oracle, _ = run_session(nvim_argv, text, keys)
+            oracle, _ = run_session(nvim_argv + extra, text, keys)
             if oracle != want:
                 notes.append(f"nvim itself gives {oracle!r} (case expectation may be wrong)")
             if oracle != got:
