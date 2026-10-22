@@ -1337,6 +1337,18 @@ function vim.fn.feedkeys(keys, mode)
   return 0
 end
 
+-- vim.on_key: register a callback for key presses. Returns a namespace ID.
+-- Currently a stub that doesn't actually call the callbacks (no key event system yet).
+local _on_key_ns = 0
+function vim.on_key(fn, ns_id)
+  if ns_id == 0 or ns_id == nil then
+    _on_key_ns = _on_key_ns + 1
+    ns_id = _on_key_ns
+  end
+  -- TODO: actually register the callback and call it on key presses
+  return ns_id
+end
+
 function vim.fn.getftime(path)
   local stat = vim.uv.fs_stat(path)
   return stat and stat.mtime and stat.mtime.sec or -1
@@ -2479,6 +2491,7 @@ local window_vars = {}
 local tab_vars = {}
 local vvars = {
   version = 801,
+  vim_did_enter = 0,
   lua = true,
   maxcol = 2147483647,
   numbermax = 9223372036854775807,

@@ -35,4 +35,6 @@ See `docs/DISTRO-LOOP.md` §3 step 7.
 2026-10-22 DISTRO-114 keymap normalization + write_file empty-line | extra_keymaps: 162→0, missing_keymaps: 291→0 | commit 5709464
 
 2026-10-22 DISTRO-115 defer netrw/tutor setup to respect g:loaded_* guards | netrw extra commands: 14→1; netrw augroups: gzip/tar/zip/Network remain | commit e0fe93f
-2026-10-22 DISTRO-116 winsaveview/winrestview + feedkeys | verify 32/32 (adds TASK-115) | commit pending
+2026-10-22 DISTRO-116 winsaveview/winrestview + feedkeys | verify 32/32 (adds TASK-115) | commit 00934a5
+
+2026-10-22 DISTRO-117 vim_did_enter vvar + BufEnter/UIEnter ordering + vim.on_key stub | modules: IDENTICAL; augroups extra: 4→3, missing: 2→1; commands extra: 1→1 | commit 6e54e84

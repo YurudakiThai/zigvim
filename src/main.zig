@@ -323,11 +323,30 @@ pub fn main(init: std.process.Init) !void {
     }
 
 
+    // Set vim.v.vim_did_enter = 1 before firing VimEnter
+    c.lua_getglobal(L, "vim");
+    c.lua_getfield(L, -1, "v");
+    c.lua_pushinteger(L, 1);
+    c.lua_setfield(L, -2, "vim_did_enter");
+    c.lua_pop(L, 1); // pop vim.v
+    c.lua_pop(L, 1); // pop vim
+
     // Fire VimEnter and UIEnter events (needed by lazy.nvim and other plugins)
 
     c.lua_getglobal(L, "vim");
     c.lua_getfield(L, -1, "_exec_autocmds");
     c.lua_pushstring(L, "VimEnter");
+    c.lua_newtable(L);
+    if (c.lua_pcall(L, 2, 0, 0) != 0) {
+        c.lua_pop(L, 1); // pop error message
+    }
+
+    // Fire BufEnter for the initial buffer (buffer 1) BEFORE UIEnter
+    // This is needed for plugins like snacks.explorer that load on BufEnter
+    // snacks.setup() creates a once=true autocmd for multiple events;
+    // the first event to fire removes the autocmd, so order matters.
+    c.lua_getfield(L, -1, "_exec_autocmds");
+    c.lua_pushstring(L, "BufEnter");
     c.lua_newtable(L);
     if (c.lua_pcall(L, 2, 0, 0) != 0) {
         c.lua_pop(L, 1); // pop error message
