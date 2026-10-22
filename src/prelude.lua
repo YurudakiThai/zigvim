@@ -2383,6 +2383,22 @@ function vim._startup(skip_user_config)
     end
   end
 
+  -- Load netrw after init.lua so plugins can disable it via g:loaded_netrw
+  local ok_netrw, netrw = pcall(require, 'vim._netrw')
+  if ok_netrw then
+    netrw.setup()
+  else
+    io.stderr:write('Warning: failed to load vim._netrw: ' .. tostring(netrw) .. '\n')
+  end
+
+  -- Load tutor after init.lua so plugins can disable it via g:loaded_tutor_mode_plugin
+  local ok_tutor, tutor = pcall(require, 'vim._tutor')
+  if ok_tutor then
+    tutor.setup()
+  else
+    io.stderr:write('Warning: failed to load vim._tutor: ' .. tostring(tutor) .. '\n')
+  end
+
   -- Neovim enables filetype detection, ftplugins, indent and syntax between
   -- init.lua and the runtime plugins; plugins may rely on it being on.
   vim._setup_filetype()
@@ -2398,10 +2414,16 @@ function vim._startup(skip_user_config)
         table.sort(files)  -- Sort to ensure consistent loading order
         for _, name in ipairs(files) do
           if name:match('%.lua$') then
-            local plugin_path = plugin_dir .. '/' .. name
-            local plugin_ok, plugin_err = pcall(dofile, plugin_path)
-            if not plugin_ok then
-              io.stderr:write('Error in ' .. plugin_path .. ': ' .. tostring(plugin_err) .. '\n')
+            -- Check if plugin is disabled via g:loaded_<plugin>
+            local plugin_name = name:sub(1, -5)  -- Remove .lua extension
+            if vim.g['loaded_' .. plugin_name] then
+              -- Plugin is disabled, skip it
+            else
+              local plugin_path = plugin_dir .. '/' .. name
+              local plugin_ok, plugin_err = pcall(dofile, plugin_path)
+              if not plugin_ok then
+                io.stderr:write('Error in ' .. plugin_path .. ': ' .. tostring(plugin_err) .. '\n')
+              end
             end
           end
           -- Skip .vim files for now (no Vimscript engine yet)
@@ -4880,28 +4902,12 @@ else
   io.stderr:write('Warning: failed to load vim._matchparen: ' .. tostring(matchparen) .. '\n')
 end
 
--- netrw: directory browsing plus the :Explore/:N* commands and Network group.
-local ok_netrw, netrw = pcall(require, 'vim._netrw')
-if ok_netrw then
-  netrw.setup()
-else
-  io.stderr:write('Warning: failed to load vim._netrw: ' .. tostring(netrw) .. '\n')
-end
-
 -- gzip.vim / tarPlugin.vim / zipPlugin.vim: compressed files and archives.
 local ok_archives, archives = pcall(require, 'vim._archives')
 if ok_archives then
   archives.setup()
 else
   io.stderr:write('Warning: failed to load vim._archives: ' .. tostring(archives) .. '\n')
-end
-
--- tutor.vim: the :Tutor command.
-local ok_tutor, tutor = pcall(require, 'vim._tutor')
-if ok_tutor then
-  tutor.setup()
-else
-  io.stderr:write('Warning: failed to load vim._tutor: ' .. tostring(tutor) .. '\n')
 end
 
 -- rplugin.vim: the manifest and :UpdateRemotePlugins command.

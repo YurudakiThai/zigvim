@@ -36,6 +36,10 @@ function M.complete(arg_lead)
 end
 
 function M.setup()
+  if vim.g.loaded_tutor_mode_plugin then
+    return
+  end
+  vim.g.loaded_tutor_mode_plugin = 1
   api.nvim_create_user_command('Tutor', function(cmd)
     open_tutor(cmd.args)
   end, {

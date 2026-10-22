@@ -1,4 +1,4 @@
-if vim.g.loaded_nvim_net_plugin ~= nil then
+if vim.g.loaded_netrw ~= nil or vim.g.loaded_netrwPlugin ~= nil or vim.g.loaded_nvim_net_plugin ~= nil then
   return
 end
 vim.g.loaded_nvim_net_plugin = true
