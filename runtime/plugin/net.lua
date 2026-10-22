@@ -1,6 +1,6 @@
-if vim.g.loaded_netrw ~= nil or vim.g.loaded_netrwPlugin ~= nil or vim.g.loaded_nvim_net_plugin ~= nil then
-  return
-end
+-- net.lua is a separate plugin from netrw. It provides the nvim.net.remotefile
+-- augroup for editing remote files via HTTP/HTTPS. It should always run
+-- regardless of whether netrw is loaded.
 vim.g.loaded_nvim_net_plugin = true
 
 local augroup = vim.api.nvim_create_augroup('nvim.net.remotefile', {})

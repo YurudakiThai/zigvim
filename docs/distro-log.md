@@ -38,3 +38,4 @@ See `docs/DISTRO-LOOP.md` §3 step 7.
 2026-10-22 DISTRO-116 winsaveview/winrestview + feedkeys | verify 32/32 (adds TASK-115) | commit 00934a5
 
 2026-10-22 DISTRO-117 vim_did_enter vvar + BufEnter/UIEnter ordering + vim.on_key stub | modules: IDENTICAL; augroups extra: 4→3, missing: 2→1; commands extra: 1→1 | commit 6e54e84
+2026-10-23 DISTRO-118 match nvim runtime plugin loading behavior | distro_diff: IDENTICAL; verify 32/32 | commit 15f1ae3

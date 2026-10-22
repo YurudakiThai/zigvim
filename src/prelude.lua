@@ -2438,12 +2438,23 @@ function vim._startup(skip_user_config)
     io.stderr:write('Warning: failed to load vim._netrw: ' .. tostring(netrw) .. '\n')
   end
 
-  -- Load tutor after init.lua so plugins can disable it via g:loaded_tutor_mode_plugin
-  local ok_tutor, tutor = pcall(require, 'vim._tutor')
-  if ok_tutor then
-    tutor.setup()
-  else
-    io.stderr:write('Warning: failed to load vim._tutor: ' .. tostring(tutor) .. '\n')
+  -- tutor.vim is not sourced in Neovim 0.12.6 with user configs (only in --clean mode).
+  -- We load it only in clean mode to match real nvim's behavior.
+  if skip_user_config then
+    local ok_tutor, tutor = pcall(require, 'vim._tutor')
+    if ok_tutor then
+      tutor.setup()
+    end
+  end
+
+  -- gzip.vim / tarPlugin.vim / zipPlugin.vim: compressed files and archives.
+  -- These .vim plugins are not sourced in Neovim 0.12.6 with user configs (only in --clean mode).
+  -- We load them only in clean mode to match real nvim's behavior.
+  if skip_user_config then
+    local ok_archives, archives = pcall(require, 'vim._archives')
+    if ok_archives then
+      archives.setup()
+    end
   end
 
   -- Neovim enables filetype detection, ftplugins, indent and syntax between
@@ -4948,14 +4959,6 @@ if ok_matchparen then
   matchparen.setup()
 else
   io.stderr:write('Warning: failed to load vim._matchparen: ' .. tostring(matchparen) .. '\n')
-end
-
--- gzip.vim / tarPlugin.vim / zipPlugin.vim: compressed files and archives.
-local ok_archives, archives = pcall(require, 'vim._archives')
-if ok_archives then
-  archives.setup()
-else
-  io.stderr:write('Warning: failed to load vim._archives: ' .. tostring(archives) .. '\n')
 end
 
 -- rplugin.vim: the manifest and :UpdateRemotePlugins command.
