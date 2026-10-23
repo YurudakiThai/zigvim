@@ -19,11 +19,11 @@ for task in "$ROOT/tasks"/TASK-*.md; do
   if [[ "$name" == "TASK-TEMPLATE" ]]; then
     continue
   fi
-  ((total++))
+  total=$((total + 1))
 
   # Tasks without an executable case can record their completion in the card.
   if grep -q 'Status:.*Complete' "$task"; then
-    ((pass++))
+    pass=$((pass + 1))
     echo "✅ $name: PASS (documented complete)"
     continue
   fi
@@ -32,23 +32,23 @@ for task in "$ROOT/tasks"/TASK-*.md; do
   if [[ "$name" == "TASK-INFRA-005" ]]; then
     ZIGVIM="${ZIGVIM:-$ROOT/zig-out/bin/zigvim}"
     if python3 "$DIR/rpc_verify.py" --zigvim "$ZIGVIM" >/dev/null 2>&1; then
-      ((pass++))
+      pass=$((pass + 1))
       echo "✅ $name: PASS"
     else
-      ((fail++))
+      fail=$((fail + 1))
       echo "❌ $name: FAIL"
     fi
   elif [[ -f "$ROOT/cases/$name.lua" ]]; then
     ZIGVIM="${ZIGVIM:-$ROOT/zig-out/bin/zigvim}"
     if python3 "$DIR/oracle.py" --test "$ROOT/cases/$name.lua" --zigvim "$ZIGVIM" "$@" 2>/dev/null; then
-      ((pass++))
+      pass=$((pass + 1))
       echo "✅ $name: PASS"
     else
-      ((fail++))
+      fail=$((fail + 1))
       echo "❌ $name: FAIL"
     fi
   else
-    ((pending++))
+    pending=$((pending + 1))
     echo "⏳ $name: pending (no test yet)"
   fi
 done
