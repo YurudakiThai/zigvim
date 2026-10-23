@@ -413,6 +413,91 @@ local function visual_bounds()
   return ar, ac, cr, cc
 end
 
+-- Decoration providers (nvim_set_decoration_provider), called like Neovim's redraw:
+-- on_start, on_buf, on_win with the visible rows (0-based), on_line per row, on_end.
+-- A false return from on_start or on_win skips the rest for that provider.
+local function run_decoration_providers(top, bot)
+  local providers = vim._decoration_providers
+  if not providers or next(providers) == nil then
+    return
+  end
+  S.tick = (S.tick or 0) + 1
+  local win, buf = api.nvim_get_current_win(), api.nvim_get_current_buf()
+  local ids = vim.tbl_keys(providers)
+  table.sort(ids)
+  for _, ns in ipairs(ids) do
+    local p = providers[ns]
+    local ok, res = true, nil
+    if p.on_start then
+      ok, res = pcall(p.on_start, 'start', S.tick)
+    end
+    if ok and res ~= false then
+      if p.on_buf then
+        pcall(p.on_buf, 'buf', buf, S.tick)
+      end
+      local wok, wres = true, nil
+      if p.on_win then
+        wok, wres = pcall(p.on_win, 'win', win, buf, top - 1, bot - 1)
+      end
+      if wok and wres ~= false and p.on_line then
+        for row = top - 1, bot - 1 do
+          pcall(p.on_line, 'line', win, buf, row)
+        end
+      end
+      if p.on_end then
+        pcall(p.on_end, 'end', S.tick)
+      end
+    end
+  end
+end
+
+-- Width of the sign column from 'signcolumn' ("yes", "yes:N", "auto", "auto:M-N", "no").
+-- shortcut: "number" (signs drawn in the number column) shows no signs.
+local function sign_width()
+  local sc = tostring(vim.o.signcolumn or 'auto')
+  if sc == 'no' or sc == 'number' then
+    return 0
+  end
+  if sc:match('^yes') then
+    return 2 * (tonumber(sc:match(':(%d+)$')) or 1)
+  end
+  local any = api.nvim_buf_get_extmarks(0, -1, 0, -1, { type = 'sign', limit = 1 })
+  return #any > 0 and 2 or 0
+end
+
+-- Highest-priority sign per buffer row (0-based) in [top, bot], ready to draw.
+-- shortcut: one sign per line even with a wider column; extra signs are not shown.
+local function collect_signs(top, bot)
+  local by_row = {}
+  local marks = api.nvim_buf_get_extmarks(0, -1, { top - 1, 0 }, { bot - 1, -1 }, { details = true, type = 'sign' })
+  for _, m in ipairs(marks) do
+    local d = m[4]
+    local cur = by_row[m[2]]
+    if not cur or (d.priority or 0) > cur.priority or ((d.priority or 0) == cur.priority and m[1] > cur.id) then
+      by_row[m[2]] = { id = m[1], priority = d.priority or 0, text = d.sign_text, hl = d.sign_hl_group }
+    end
+  end
+  return by_row
+end
+
+local function hl_escape(name)
+  if not name then
+    return ''
+  end
+  local ok, hl = pcall(api.nvim_get_hl, 0, { name = name, link = false })
+  if not ok or not hl then
+    return ''
+  end
+  local esc = ''
+  if hl.fg then
+    esc = esc .. string.format('\27[38;2;%d;%d;%dm', math.floor(hl.fg / 65536) % 256, math.floor(hl.fg / 256) % 256, hl.fg % 256)
+  end
+  if hl.bg then
+    esc = esc .. string.format('\27[48;2;%d;%d;%dm', math.floor(hl.bg / 65536) % 256, math.floor(hl.bg / 256) % 256, hl.bg % 256)
+  end
+  return esc
+end
+
 local function draw()
   local rows, cols = vim._tty_size()
   S.rows, S.cols = rows, cols
@@ -423,7 +508,8 @@ local function draw()
   if number or rnu then
     gw = math.max(3, #tostring(n)) + 1
   end
-  local textcols = math.max(1, cols - gw)
+  local sw = sign_width()
+  local textcols = math.max(1, cols - sw - gw)
 
   clamp()
   local so = vim.o.scrolloff
@@ -455,6 +541,14 @@ local function draw()
   end
 
   local lines = api.nvim_buf_get_lines(0, S.top - 1, S.top - 1 + textrows, false)
+  local bot = math.min(n, S.top + textrows - 1)
+  pcall(api.nvim_win_set_cursor, 0, { S.row, S.col })
+  run_decoration_providers(S.top, bot)
+  if sw == 0 then
+    sw = sign_width() -- providers may have placed the first sign ('signcolumn' auto)
+    textcols = math.max(1, cols - sw - gw)
+  end
+  local signs = sw > 0 and collect_signs(S.top, bot) or {}
   local vr1, vc1, vr2, vc2
   if S.mode == 'v' or S.mode == 'V' then
     vr1, vc1, vr2, vc2 = visual_bounds()
@@ -466,6 +560,15 @@ local function draw()
     out[#out + 1] = string.format('\27[%d;1H', r + 1)
     local text = lines[r + 1]
     if text and lnum <= n then
+      if sw > 0 then
+        local sign = signs[lnum - 1]
+        if sign and sign.text then
+          local stext = sign.text .. (' '):rep(math.max(0, sw - str_width(sign.text)))
+          out[#out + 1] = hl_escape(sign.hl) .. stext .. '\27[0m'
+        else
+          out[#out + 1] = (' '):rep(sw)
+        end
+      end
       if gw > 0 then
         local label
         local current = lnum == S.row
@@ -554,12 +657,13 @@ local function draw()
   if S.cmdtype then
     out[#out + 1] = string.format('\27[%d;%dH', rows, str_width(bottom) + 1)
   else
-    out[#out + 1] = string.format('\27[%d;%dH', S.row - S.top + 1, gw + (dc - S.left) + 1)
+    out[#out + 1] = string.format('\27[%d;%dH', S.row - S.top + 1, sw + gw + (dc - S.left) + 1)
   end
   out[#out + 1] = '\27[?25h'
   write(table.concat(out))
 
   pcall(api.nvim_win_set_cursor, 0, { S.row, S.col })
+  S.drawn_gen = vim._ui_gen
 end
 
 -- -------------------------------------------------------------------- input
@@ -693,8 +797,8 @@ local function getkey()
         end
       else
         local rows, cols = vim._tty_size()
-        if rows * 1000 + cols ~= last_size then
-          draw()
+        if rows * 1000 + cols ~= last_size or vim._ui_gen ~= S.drawn_gen then
+          draw() -- resized, or async work (e.g. gitsigns) changed what is shown
           last_size = rows * 1000 + cols
         end
       end

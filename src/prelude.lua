@@ -75,16 +75,24 @@ vim.empty_dict = function()
   return setmetatable({}, vim._empty_dict_mt)
 end
 
+-- Like Neovim's cjson: a table with only positive integer keys is an array (holes
+-- become null) if its highest index is <= 10 or <= 2 * its entry count; sparser
+-- than that is an error. Returns the array length, or nil for an object.
 local function is_array(t)
-  local n = #t
-  if n == 0 then
-    return false
+  local max, count = 0, 0
+  for k in pairs(t) do
+    if type(k) ~= 'number' or k < 1 or k % 1 ~= 0 then
+      return nil
+    end
+    max, count = math.max(max, k), count + 1
   end
-  local count = 0
-  for _ in pairs(t) do
-    count = count + 1
+  if max == 0 then
+    return nil
   end
-  return count == n
+  if max > 10 and max > 2 * count then
+    error('Cannot serialise table: excessively sparse array', 0)
+  end
+  return max
 end
 
 local encode_value
@@ -123,9 +131,10 @@ function encode_value(v)
       return '[]' -- like Neovim: only vim.empty_dict() encodes as {}
     end
     local parts = {}
-    if is_array(v) then
-      for i = 1, #v do
-        parts[i] = encode_value(v[i])
+    local len = is_array(v)
+    if len then
+      for i = 1, len do
+        parts[i] = v[i] == nil and 'null' or encode_value(v[i])
       end
       return '[' .. table.concat(parts, ',') .. ']'
     end
@@ -1030,7 +1039,12 @@ end
 
 -- Stub: nvim__redraw is a private API used by vim.diagnostic and other modules.
 -- No-op for now since zigvim doesn't have a real redraw mechanism.
+-- Bumped whenever something drawn changes outside a keypress (extmarks, explicit
+-- redraws); the TUI redraws on its idle tick when it moved.
+vim._ui_gen = 0
+
 function vim.api.nvim__redraw(_)
+  vim._ui_gen = vim._ui_gen + 1
 end
 
 -- ------------------------------------------------------------ defer_fn
@@ -1246,8 +1260,8 @@ function vim.fn.getregionpos(pos1, pos2, opts)
 
   local regions = {}
   if regtype == 'V' then
-    for lnum = start[2], finish[2] do
-      regions[#regions + 1] = { { buf, lnum, 1, 0 }, { buf, lnum, maxcol, 0 } }
+    for lnum = math.min(start[2], finish[2]), math.max(start[2], finish[2]) do
+      regions[#regions + 1] = { { buf, lnum, 1, 0 }, { buf, lnum, line_length(lnum), 0 } }
     end
     return regions
   end
@@ -1271,14 +1285,29 @@ function vim.fn.getregionpos(pos1, pos2, opts)
   if to[2] < from[2] or (to[2] == from[2] and to[3] < from[3]) then
     from, to = to, from
   end
-  local endcol = to[3]
-  if exclusive then
-    endcol = endcol - 1
+  -- One region per line. An exclusive end steps back one character (to the end of
+  -- the previous line from column 1); a zero-width range stays one character.
+  local end_lnum, endcol = to[2], to[3]
+  if exclusive and not (from[2] == to[2] and from[3] == to[3]) then
+    if endcol > 1 then
+      endcol = endcol - 1
+      local line = lines[end_lnum] or ''
+      while endcol > 1 and (line:byte(endcol) or 0) >= 0x80 and line:byte(endcol) < 0xC0 do
+        endcol = endcol - 1
+      end
+    elseif end_lnum > from[2] then
+      end_lnum = end_lnum - 1
+      endcol = line_length(end_lnum)
+    end
   end
-  if endcol < 1 then
-    return {}
+  for lnum = from[2], end_lnum do
+    local first = lnum == from[2] and from[3] or 1
+    if not opts.eol then
+      first = math.min(first, line_length(lnum)) -- an empty line gives column 0
+    end
+    local last = lnum == end_lnum and math.min(endcol, line_length(lnum)) or line_length(lnum)
+    regions[#regions + 1] = { { buf, lnum, first, 0 }, { buf, lnum, last, 0 } }
   end
-  regions[1] = { { buf, from[2], from[3], 0 }, { buf, to[2], endcol, 0 } }
   return regions
 end
 
@@ -4420,6 +4449,9 @@ do
   local next_extmark_id = 1
 
   local function ns_marks(buf, ns)
+    if buf == 0 then
+      buf = vim.api.nvim_get_current_buf()
+    end
     local per_buffer = extmarks[buf]
     if not per_buffer then
       per_buffer = {}
@@ -4435,6 +4467,7 @@ do
 
   vim.api.nvim_buf_set_extmark = function(buf, ns, line, col, opts)
     opts = opts or {}
+    vim._ui_gen = vim._ui_gen + 1
     local marks = ns_marks(buf, ns)
     local id = opts.id or next_extmark_id
     if not opts.id then
@@ -4452,8 +4485,10 @@ do
       virt_text = opts.virt_text,
       virt_text_pos = opts.virt_text_pos,
       virt_lines = opts.virt_lines,
-      sign_text = opts.sign_text,
+      -- Neovim pads sign text to two cells
+      sign_text = opts.sign_text and (vim.fn.strdisplaywidth(opts.sign_text) < 2 and opts.sign_text .. ' ' or opts.sign_text),
       sign_hl_group = opts.sign_hl_group,
+      ns_id = ns,
       number_hl_group = opts.number_hl_group,
       line_hl_group = opts.line_hl_group,
       cursorline_hl_group = opts.cursorline_hl_group,
@@ -4471,6 +4506,17 @@ do
   vim.api.nvim_buf_get_extmarks = function(buf, ns, start, end_, opts)
     opts = opts or {}
     local marks = ns_marks(buf, ns)
+    if ns == -1 then -- every namespace
+      marks = {}
+      local per_buffer = extmarks[buf == 0 and vim.api.nvim_get_current_buf() or buf] or {}
+      for _, list in pairs(per_buffer) do
+        for id, mark in pairs(list) do
+          marks[id] = mark
+        end
+      end
+    end
+    local kinds = { sign = 'sign_text', highlight = 'hl_group', virt_text = 'virt_text', virt_lines = 'virt_lines' }
+    local want = opts.type and kinds[opts.type]
     local start_row = 0
     local start_col = 0
     if type(start) == 'table' then
@@ -4483,6 +4529,12 @@ do
       end_row, end_col = math.huge, math.huge
     elseif type(end_) == 'table' then
       end_row, end_col = end_[1] or 0, end_[2] or 0
+      if end_row == -1 then
+        end_row = math.huge
+      end
+      if end_col == -1 then -- -1 means end of line, like Neovim
+        end_col = math.huge
+      end
     else
       end_row, end_col = end_, math.huge
     end
@@ -4490,16 +4542,20 @@ do
     for _, mark in pairs(marks) do
       local after_start = mark.row > start_row or (mark.row == start_row and (mark.col or 0) >= start_col)
       local before_end = mark.row < end_row or (mark.row == end_row and (mark.col or 0) <= end_col)
-      if (opts.type == nil or true) and after_start and before_end then
+      if (not want or mark[want] ~= nil) and after_start and before_end then
         if opts.details then
           local details = { }
           for _, key in ipairs({
             'end_row', 'end_col', 'hl_group', 'hl_eol', 'priority', 'virt_text',
             'virt_text_pos', 'virt_lines', 'sign_text', 'sign_hl_group',
             'number_hl_group', 'line_hl_group', 'cursorline_hl_group', 'conceal',
-            'spell', 'ui_watched', 'right_gravity', 'end_right_gravity',
+            'spell', 'ui_watched', 'right_gravity', 'end_right_gravity', 'ns_id',
           }) do
             details[key] = mark[key]
+          end
+          details.priority = details.priority or 4096
+          if details.right_gravity == nil then
+            details.right_gravity = true
           end
           out[#out + 1] = { mark.id, mark.row, mark.col, details }
         else
@@ -4533,6 +4589,7 @@ do
   end
 
   vim.api.nvim_buf_del_extmark = function(buf, ns, id)
+    vim._ui_gen = vim._ui_gen + 1
     local marks = ns_marks(buf, ns)
     if marks[id] == nil then
       return false
@@ -4542,6 +4599,7 @@ do
   end
 
   vim.api.nvim_buf_clear_namespace = function(buf, ns, line_start, line_end)
+    vim._ui_gen = vim._ui_gen + 1
     local buffer_marks = extmarks[buf] or {}
     if ns == -1 then
       for _, marks in pairs(buffer_marks) do
