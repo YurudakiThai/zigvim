@@ -27,3 +27,20 @@ config next to Neovim 0.12.6 and counts zigvim-only errors on screen. Fixed:
 Language servers now attach, which exposes the LSP surface: incremental sync
 (`on_lines` must pass resolved line numbers and byte counts),
 `nvim_get_option_info2`, `vim.fn.bufloaded`, and more. Next piece.
+
+## Round 2 (after the first blind critic: distinguishable on 7/7 files)
+
+- TASK-141 `on_lines` gets resolved 0-based line numbers (LSP incremental sync
+  asserted on -1); `nvim_get_option_info2` / `nvim_get_all_options_info` from
+  oracle-generated metadata (scripts/gen_options_info.lua); `vim.fn.bufloaded`
+  (format-on-save went through it and failed).
+- TASK-142 `vim.str_utf_start/end/pos`; `bufadd`/`bufload` with unloaded
+  buffers; `buflisted` honours 'buflisted'; vim.glob/ui/snippet/provider load lazily.
+- TASK-143 `:augroup` / `augroup END`, `|` between commands, `:execute`,
+  `:messages`; `vim.type_idx` / `vim.val_idx` / `vim.types`.
+- TASK-144 `nvim_exec2({output = true})` captures :echo and :autocmd listings;
+  `nvim_exec`; `screenrow` / `screencol`.
+- Embedded prelude/TUI load under real chunk names, so tracebacks no longer print
+  the whole source.
+
+Sweep (7 filetypes, real LazyVim config): zigvim-only errors 5 → 0.

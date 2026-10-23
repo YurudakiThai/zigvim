@@ -657,7 +657,8 @@ local function draw()
   if S.cmdtype then
     out[#out + 1] = string.format('\27[%d;%dH', rows, str_width(bottom) + 1)
   else
-    out[#out + 1] = string.format('\27[%d;%dH', S.row - S.top + 1, sw + gw + (dc - S.left) + 1)
+    S.screen_row, S.screen_col = S.row - S.top + 1, sw + gw + (dc - S.left) + 1
+    out[#out + 1] = string.format('\27[%d;%dH', S.screen_row, S.screen_col)
   end
   out[#out + 1] = '\27[?25h'
   write(table.concat(out))
@@ -2672,6 +2673,10 @@ function M.run()
 end
 
 vim._tui_run = M.run
+-- screenrow()/screencol(): where the cursor was last drawn.
+vim._tui_screen = function()
+  return S.screen_row or 1, S.screen_col or 1
+end
 
 -- :normal[!] {keys}: run the keys as normal-mode commands now; an unfinished
 -- command is ended as if <Esc> was typed. The pending typeahead is kept aside.

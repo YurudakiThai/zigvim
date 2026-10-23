@@ -1653,8 +1653,46 @@ local function exec_cmd(cmd)
   local name, rest = cmd:match('^(%S+)%s*(.*)$')
   rest = rest or ''
 
+  -- `cmd | cmd`: split on a bar outside quotes, except for commands that take the
+  -- rest of the line (Vim's :bar list). shortcut: no `\|` escape handling beyond that.
+  local takes_bar = {
+    lua = true, luado = true, normal = true, ['normal!'] = true, norm = true, ['norm!'] = true,
+    command = true, ['command!'] = true, ['!'] = true, global = true, g = true,
+  }
+  if not takes_bar[name] and not name:match('map$') and not name:match('^[nvxsoilct]?noremap$')
+    and not ((name == 'autocmd' or name == 'au') and rest:match('%S+%s+%S+%s+%S')) then
+    local quote
+    for i = 1, #cmd do
+      local ch = cmd:sub(i, i)
+      if quote then
+        if ch == quote and cmd:sub(i - 1, i - 1) ~= '\\' then
+          quote = nil
+        end
+      elseif (ch == '"' or ch == "'") and (name == 'exe' or name == 'execute' or name == 'echo' or name == 'let') then
+        quote = ch
+      elseif ch == '|' and cmd:sub(i - 1, i - 1) ~= '\\' then
+        exec_cmd(cmd:sub(1, i - 1))
+        return exec_cmd(cmd:sub(i + 1))
+      end
+    end
+  end
+
   if name == 'silent' or name == 'silent!' then
     exec_cmd(rest)
+  elseif name == 'augroup' or name == 'aug' or name == 'augroup!' or name == 'aug!' then
+    -- :augroup {name} sets the group later :autocmd lines go to; END resets it.
+    if name:sub(-1) == '!' then
+      pcall(vim.api.nvim_del_augroup_by_name, rest)
+    elseif rest:upper() == 'END' then
+      vim._cur_augroup = nil
+    elseif rest ~= '' then
+      vim.api.nvim_create_augroup(rest, { clear = false })
+      vim._cur_augroup = rest
+    end
+  elseif name == 'exe' or name == 'execute' or name == 'exec' then
+    exec_cmd(tostring(vim.api.nvim_eval(rest)))
+  elseif name == 'messages' or name == 'mes' then
+    -- shortcut: no message history is kept yet, so :messages shows nothing
   elseif name == 'normal' or name == 'normal!' or name == 'norm' or name == 'norm!' then
     -- shortcut: only runs while the TUI is active; headless :normal is a no-op.
     if vim._tui_normal then
@@ -1771,7 +1809,7 @@ local function exec_cmd(cmd)
     or name == 'xmapclear' or name == 'omapclear' or name == 'imapclear'
     or name == 'cmapclear' or name == 'tmapclear' then
     -- Unmap commands: accepted but not fully implemented (would need to iterate and delete)
-  elseif name == 'augroup' or name == 'aug' or name == 'packadd' or name == 'filetype'
+  elseif name == 'packadd' or name == 'filetype'
     or name == 'syntax' or name == 'syn'
     or name == 'menu' or name == 'amenu' or name == 'nmenu' or name == 'vmenu'
     or name == 'imenu' or name == 'cmenu' or name == 'omenu' or name == 'tmenu'
@@ -1878,7 +1916,7 @@ local function exec_cmd(cmd)
       vim.bo.filetype = first
     end
   elseif name == 'echo' then
-    io.stdout:write(tostring(vim.api.nvim_eval(rest)) .. '\n')
+    vim._out(tostring(vim.api.nvim_eval(rest)) .. '\n')
   elseif vim._user_commands
     and (vim._user_commands[name] or (name:sub(-1) == '!' and vim._user_commands[name:sub(1, -2)])) then
     local bang = name:sub(-1) == '!'
@@ -1995,17 +2033,132 @@ vim.api.nvim_cmd = function(cmd, _opts)
   return nil
 end
 
-vim.api.nvim_exec2 = function(src, _)
-  exec_lines(src, false)
-  return { output = '' }
+-- Command output (:echo, :autocmd listings) goes through vim._out so
+-- nvim_exec2({output = true}) can capture it.
+local out_stack = {}
+function vim._out(text)
+  local top = out_stack[#out_stack]
+  if top then
+    top[#top + 1] = text
+  else
+    io.stdout:write(text)
+  end
+end
+
+vim.api.nvim_exec2 = function(src, opts)
+  if not (opts and opts.output) then
+    exec_lines(src, false)
+    return vim.empty_dict()
+  end
+  out_stack[#out_stack + 1] = {}
+  local ok, e = pcall(exec_lines, src, false)
+  local captured = table.remove(out_stack)
+  if not ok then
+    error(e, 0)
+  end
+  return { output = (table.concat(captured):gsub('\n$', '')) }
+end
+
+-- Deprecated, still used (lualine): returns the output when {output} is true, else ''.
+vim.api.nvim_exec = function(src, output)
+  return output and vim.api.nvim_exec2(src, { output = true }).output or (vim.api.nvim_exec2(src, {}) and '')
 end
 
 vim.api.nvim_exec_lua = function(code, args)
   return exec_lua(code, args)
 end
 
+-- Buffers made by bufadd() stay unloaded (no lines) until bufload().
+-- shortcut: bufload() fires no BufRead autocommands.
+local unloaded_bufs = {}
 vim.api.nvim_buf_is_loaded = function(buf)
-  return vim.api.nvim_buf_is_valid(buf)
+  buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+  return vim.api.nvim_buf_is_valid(buf) and not unloaded_bufs[buf]
+end
+do
+  local raw_line_count = vim.api.nvim_buf_line_count
+  vim.api.nvim_buf_line_count = function(buf)
+    local id = buf == 0 and vim.api.nvim_get_current_buf() or buf
+    if unloaded_bufs[id] then
+      return 0
+    end
+    return raw_line_count(buf)
+  end
+end
+
+local function full_buf_name(name)
+  local abs = vim.fn.fnamemodify(name, ':p')
+  local dir, base = abs:match('^(.*)/([^/]*)$')
+  local real = dir and vim.uv.fs_realpath(dir ~= '' and dir or '/')
+  return real and (real:gsub('/$', '') .. '/' .. base) or abs
+end
+
+function vim.fn.bufadd(name)
+  name = tostring(name)
+  if name ~= '' then
+    local full = full_buf_name(name)
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_get_name(b) == full then
+        return b
+      end
+    end
+    name = full
+  end
+  local b = vim.api.nvim_create_buf(false, false)
+  if name ~= '' then
+    vim.api.nvim_buf_set_name(b, name)
+  end
+  unloaded_bufs[b] = true
+  return b
+end
+
+function vim.fn.bufload(buf)
+  local b = vim.fn.bufnr(buf)
+  if b > 0 and unloaded_bufs[b] then
+    unloaded_bufs[b] = nil
+    local name = vim.api.nvim_buf_get_name(b)
+    local f = name ~= '' and io.open(name, 'rb')
+    if f then
+      local data = f:read('*a')
+      f:close()
+      local lines = vim.split(data, '\n', { plain = true })
+      if lines[#lines] == '' and #lines > 1 then
+        lines[#lines] = nil
+      end
+      vim.api.nvim_buf_set_lines(b, 0, -1, false, lines)
+      vim._buf_set_modified(b, false)
+    end
+  end
+  return 0
+end
+
+-- vim.str_utf_start / str_utf_end / str_utf_pos (C in Neovim): offsets from the
+-- 1-based byte {index} to the first / last byte of the character holding it.
+local function utf_check(s, index)
+  if type(index) ~= 'number' or index < 1 or index > #s then
+    error('index out of range', 2)
+  end
+end
+function vim.str_utf_start(s, index)
+  utf_check(s, index)
+  local i = index
+  while i > 1 and s:byte(i) >= 0x80 and s:byte(i) < 0xC0 do
+    i = i - 1
+  end
+  return i - index
+end
+function vim.str_utf_end(s, index)
+  utf_check(s, index)
+  local start = index + vim.str_utf_start(s, index)
+  local ch = s:match('^[%z\1-\127\194-\244][\128-\191]*', start) or s:sub(start, start)
+  return start + #ch - 1 - index
+end
+function vim.str_utf_pos(s)
+  local out = {}
+  for start in s:gmatch('()[%z\1-\127\194-\244][\128-\191]*') do
+    out[#out + 1] = start
+  end
+  return out
 end
 
 -- The C side only allocates the buffer; apply nvim_create_buf's {listed} and {scratch}.
@@ -2630,9 +2783,16 @@ function vim._ex_autocmd(bang, rest)
   if words[1] and pcall(vim.api.nvim_get_autocmds, { group = words[1] }) then
     group = table.remove(words, 1)
   end
+  local explicit = group
+  group = group or vim._cur_augroup
   local events, pat = words[1], words[2]
-  local cmd = rest:match('^%s*' .. (group and vim.pesc(group) .. '%s+' or '') .. (events and vim.pesc(events) .. '%s*' or '')
+  local cmd = rest:match('^%s*' .. (explicit and vim.pesc(explicit) .. '%s+' or '') .. (events and vim.pesc(events) .. '%s*' or '')
     .. (pat and vim.pesc(pat) .. '%s*' or '') .. '(.*)$') or ''
+  -- shortcut: a bare `autocmd!` outside an augroup would clear the ungrouped autocmds
+  -- only; zigvim cannot select those, so it clears nothing rather than everything.
+  if bang and not group and not events then
+    return
+  end
   if bang then
     local opts = { group = group }
     if events and events ~= '*' then
@@ -2642,6 +2802,29 @@ function vim._ex_autocmd(bang, rest)
       opts.pattern = pat
     end
     pcall(vim.api.nvim_clear_autocmds, opts)
+  end
+  if not bang and cmd == '' then
+    -- listing, in Neovim's format: header, "group  Event", "    pattern   command"
+    local filter = { group = group }
+    if events and events ~= '*' then
+      filter.event = vim.split(events, ',')
+    end
+    if pat then
+      filter.pattern = pat
+    end
+    local ok, list = pcall(vim.api.nvim_get_autocmds, filter)
+    local lines, last = { '--- Autocommands ---' }, nil
+    for _, a in ipairs(ok and list or {}) do
+      local head = (a.group_name and a.group_name .. '  ' or '') .. a.event
+      if head ~= last then
+        lines[#lines + 1] = head
+        last = head
+      end
+      local what = a.command ~= '' and a.command or (a.desc or '<Lua function>')
+      lines[#lines + 1] = string.format('    %-9s %s', a.pattern or '*', what)
+    end
+    vim._out(table.concat(lines, '\n') .. '\n')
+    return
   end
   if not events or not pat or cmd == '' then
     return
@@ -3441,12 +3624,50 @@ vim.api.nvim_win_set_option = function(win, name, value)
   window_options[name] = value
   option_store[name] = value
 end
+-- Option metadata generated from the oracle (scripts/gen_options_info.lua).
+-- shortcut: was_set only knows options set through zigvim's option store, and
+-- last_set_sid/linenr/chan are always 0 (no script tracking).
+local function option_info(name, meta)
+  local default = meta.default
+  if default == nil then
+    default = option_defaults[name]
+  end
+  return {
+    name = name, shortname = meta.shortname, type = meta.type, scope = meta.scope,
+    global_local = meta.global_local, commalist = meta.commalist, flaglist = meta.flaglist,
+    allows_duplicates = meta.allows_duplicates, default = default,
+    was_set = rawget(option_store, name) ~= nil, last_set_sid = 0, last_set_linenr = 0, last_set_chan = 0,
+  }
+end
+
 vim.api.nvim_get_all_options_info = function()
   local info = {}
-  for name in pairs(option_defaults) do
-    info[name] = { name = name, type = type(option_defaults[name]) }
+  for name, meta in pairs(require('vim._options_info')) do
+    info[name] = option_info(name, meta)
   end
   return info
+end
+
+vim.api.nvim_get_option_info2 = function(name, _opts)
+  local all = require('vim._options_info')
+  local long = all[name] and name
+  if not long then
+    for n, meta in pairs(all) do
+      if meta.shortname == name then
+        long = n
+        break
+      end
+    end
+  end
+  if not long then
+    api_error("Unknown option '" .. tostring(name) .. "'")
+  end
+  return option_info(long, all[long])
+end
+
+function vim.fn.bufloaded(buf)
+  local b = vim.fn.bufnr(buf)
+  return (b > 0 and vim.api.nvim_buf_is_valid(b) and vim.api.nvim_buf_is_loaded(b)) and 1 or 0
 end
 
 -- ------------------------------------------------------------- keymaps API
@@ -3883,6 +4104,15 @@ do
   local raw_set_lines = vim.api.nvim_buf_set_lines
   vim.api.nvim_buf_set_lines = function(buf, start, end_, strict, lines)
     local id = check_buf(buf)
+    -- on_lines gets resolved 0-based lines like Neovim (-1 means past the last line)
+    local n = vim.api.nvim_buf_line_count(id)
+    if start < 0 then
+      start = n + start + 1
+    end
+    if end_ < 0 then
+      end_ = n + end_ + 1
+    end
+    start, end_ = math.min(start, n), math.min(end_, n)
     local result = raw_set_lines(id, start, end_, strict, lines)
     bump_tick(id)
     local count = 0
@@ -4708,10 +4938,16 @@ end
 
 -- Lazy-load heavy modules on first access (matches Neovim's behavior)
 do
+  -- The rest of Neovim's vim._submodules (and vim._core.editor's) that the eager list
+  -- above does not load.
   local lazy_modules = {
     diagnostic = 'vim.diagnostic',
     lsp = 'vim.lsp',
     treesitter = 'vim.treesitter',
+    glob = 'vim.glob',
+    ui = 'vim.ui',
+    snippet = 'vim.snippet',
+    provider = 'vim.provider',
   }
   local vim_mt = getmetatable(vim) or {}
   local old_index = vim_mt.__index
@@ -5303,7 +5539,8 @@ do
   end
 
   function vim.fn.buflisted(expr)
-    return vim.fn.bufexists(expr)
+    local b = vim.fn.bufnr(expr)
+    return (b > 0 and vim.api.nvim_buf_is_valid(b) and vim.bo[b].buflisted) and 1 or 0
   end
 
   function vim.fn.getbufvar(buf, name, default)
@@ -6248,6 +6485,17 @@ end
 
 -- Built-in highlight groups, as Neovim has before any colorscheme.
 vim._hl_reset()
+
+function vim.fn.screenrow()
+  return vim._tui_screen and (select(1, vim._tui_screen())) or 1
+end
+function vim.fn.screencol()
+  return vim._tui_screen and (select(2, vim._tui_screen())) or 1
+end
+
+-- Type markers Neovim's C core defines for API values (plugins index tables with them).
+vim.type_idx, vim.val_idx = true, false
+vim.types = { array = 5, float = 3, dictionary = 6, [5] = 'array', [3] = 'float', [6] = 'dictionary' }
 
 -- vim.regex (Neovim: Vim's C regex engine).
 function vim.regex(pattern)

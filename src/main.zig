@@ -387,9 +387,7 @@ fn isInteractive() bool {
 
 fn loadTui(L: *c.lua_State) !void {
     const src = @embedFile("tui.lua");
-    const z = try g_allocator.dupeSentinel(u8, src, 0);
-    defer g_allocator.free(z);
-    if (c.luaL_dostring(L, z.ptr)) {
+    if (runEmbedded(L, src, "@zigvim/tui.lua")) {
         const err = c.lua_tolstring(L, -1, null);
         if (err != null) std.debug.print("tui error: {s}\n", .{std.mem.span(err)});
         return error.TuiFailed;
@@ -608,6 +606,7 @@ const embedded_lua_modules = [_]struct { name: [:0]const u8, source: [:0]const u
     .{ .name = "vim._default_hl", .source = @embedFile("lua/vim/_default_hl.lua") },
     .{ .name = "vim._diff", .source = @embedFile("lua/vim/_diff.lua") },
     .{ .name = "vim._regex", .source = @embedFile("lua/vim/_regex.lua") },
+    .{ .name = "vim._options_info", .source = @embedFile("lua/vim/_options_info.lua") },
 };
 
 /// Expose the embedded modules as a global table that prelude.lua turns into a
@@ -636,11 +635,16 @@ fn registerLpeg(L: *c.lua_State) void {
     c.lua_pop(L, 2);
 }
 
+/// Runs embedded Lua source under a real chunk name; luaL_dostring would use the whole
+/// source as the name, so every traceback printed the file.
+fn runEmbedded(L: *c.lua_State, src: []const u8, name: [*:0]const u8) bool {
+    if (c.luaL_loadbuffer(L, src.ptr, src.len, name) != 0) return true;
+    return c.lua_pcall(L, 0, c.LUA_MULTRET, 0) != 0;
+}
+
 fn loadPrelude(L: *c.lua_State) !void {
     const src = @embedFile("prelude.lua");
-    const z = try g_allocator.dupeSentinel(u8, src, 0);
-    defer g_allocator.free(z);
-    if (c.luaL_dostring(L, z.ptr)) {
+    if (runEmbedded(L, src, "@zigvim/prelude.lua")) {
         const err = c.lua_tolstring(L, -1, null);
         if (err != null) std.debug.print("prelude error: {s}\n", .{std.mem.span(err)});
         return error.PreludeFailed;
