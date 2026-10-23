@@ -7,8 +7,9 @@ local out = {}
 out.lua_version = _VERSION
 
 -- Check LuaJIT version
+-- Only the 2.1 series: the exact build differs between Neovim's bundled LuaJIT and the system one.
 if jit then
-  out.jit_version = jit.version
+  out.jit_version = jit.version:match('^LuaJIT 2%.1') or jit.version
 else
   out.jit_version = "not LuaJIT"
 end

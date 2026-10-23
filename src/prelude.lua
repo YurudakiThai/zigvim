@@ -190,7 +190,7 @@ local function decode_string(s, i)
           if s:sub(i + 1, i + 2) == '\\u' then
             local lo = tonumber(s:sub(i + 3, i + 6), 16)
             if lo and lo >= 0xDC00 and lo <= 0xDFFF then
-              cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+              cp = 0x10000 + (cp - 0xD800) * 1024 + (lo - 0xDC00)
               i = i + 6
             end
           end

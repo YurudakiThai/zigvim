@@ -3,7 +3,8 @@
 local v = vim.version()
 io.stdout:write(vim.json.encode({
   kind = type(vim.version),
-  str = tostring(v),
+  -- not tostring(v): its '+build' suffix depends on how the oracle nvim was built
+  str = string.format('%d.%d.%d', v.major, v.minor, v.patch),
   api_level = vim.fn.api_info().version.api_level,
   in_range = vim.version.range('0.12.0 - 0.12.1'):has(v),
   ge = vim.version.ge(v, { 0, 10, 0 }),
