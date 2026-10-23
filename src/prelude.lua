@@ -1529,11 +1529,23 @@ local function edit_path(path)
     fire_autocmd('BufWinEnter', {buffer = 0})
     return
   end
+  -- Neovim's order: BufReadPre, read, BufReadPost (FileType) -- or BufNewFile for a
+  -- missing file -- then BufEnter, BufWinEnter; for the file given on the command
+  -- line BufWinEnter comes first and startup fires BufEnter.
+  -- shortcut: the current buffer is reused, so there is no BufNew/BufAdd.
   local lines = read_file(full)
   vim.api.nvim_buf_set_name(0, path)
+  if lines then
+    fire_autocmd('BufReadPre', {buffer = 0})
+  end
   vim.api.nvim_buf_set_lines(0, 0, -1, false, lines or { '' })
   vim._buf_set_modified(0, false)
-  fire_autocmd('BufReadPost', {buffer = 0})
+  fire_autocmd(lines and 'BufReadPost' or 'BufNewFile', {buffer = 0})
+  if vim._startup_edit then
+    vim._startup_edit = nil
+    fire_autocmd('BufWinEnter', {buffer = 0})
+    return
+  end
   fire_autocmd('BufEnter', {buffer = 0})
   fire_autocmd('BufWinEnter', {buffer = 0})
 end
@@ -2028,14 +2040,23 @@ vim.api.nvim_buf_detach = function(buf)
   return true
 end
 
+-- Like Neovim: a callback error is reported, not raised into the edit, and a
+-- callback returning true detaches.
 local function fire_buf_attach(buf, firstline, lastline, new_lastline)
   local callbacks = buffer_attach_callbacks[buf]
   if not callbacks then
     return
   end
-  for _, opts in ipairs(callbacks) do
+  for i = #callbacks, 1, -1 do
+    local opts = callbacks[i]
     if opts.on_lines then
-      opts.on_lines(nil, buf, nil, firstline, lastline, new_lastline)
+      local tick = vim.api.nvim_buf_get_changedtick and vim.api.nvim_buf_get_changedtick(buf) or 0
+      local ok, res = pcall(opts.on_lines, 'lines', buf, tick, firstline, lastline, new_lastline)
+      if not ok then
+        vim.notify('Error in on_lines callback: ' .. tostring(res), vim.log.levels.ERROR)
+      elseif res == true then
+        table.remove(callbacks, i)
+      end
     end
   end
 end
@@ -2210,6 +2231,116 @@ function vim.fn.executable(name)
   end
   local ok = os.execute(command)
   return (ok == true or ok == 0) and 1 or 0
+end
+
+-- exepath({name}): full path of an executable from $PATH (or {name} itself if it has a '/').
+function vim.fn.exepath(name)
+  name = tostring(name)
+  if name == '' then
+    return ''
+  end
+  if name:find('/', 1, true) then
+    return vim.fn.executable(name) == 1 and vim.fn.fnamemodify(name, ':p') or ''
+  end
+  for dir in (os.getenv('PATH') or ''):gmatch('[^:]+') do
+    local p = dir .. '/' .. name
+    local st = vim.uv.fs_stat(p)
+    if st and st.type == 'file' and vim.fn.executable(p) == 1 then
+      return p
+    end
+  end
+  return ''
+end
+
+-- Marks: buffer marks (a-z and specials) per buffer, file marks (A-Z) global.
+-- shortcut: marks do not move when lines are inserted or deleted, and the TUI has
+-- no m/'/` commands yet; '" and '. are reported at line 1 (Neovim tracks them).
+do
+  local buf_marks, file_marks = {}, {}
+  local function bufnr(buf)
+    return (buf == 0 or buf == nil) and vim.api.nvim_get_current_buf() or buf
+  end
+  local function check_name(name)
+    if type(name) ~= 'string' or #name ~= 1 then
+      api_error("Invalid mark name (must be a single char): '" .. tostring(name) .. "'")
+    end
+  end
+  vim.api.nvim_buf_set_mark = function(buf, name, line, col, _opts)
+    buf = bufnr(buf)
+    check_name(name)
+    if line < 1 or line > vim.api.nvim_buf_line_count(buf) then
+      api_error("Invalid 'line': out of range")
+    end
+    if name:match('%u') then
+      file_marks[name] = { buf, line, col }
+    else
+      buf_marks[buf] = buf_marks[buf] or {}
+      buf_marks[buf][name] = { line, col }
+    end
+    return true
+  end
+  vim.api.nvim_buf_get_mark = function(buf, name)
+    buf = bufnr(buf)
+    check_name(name)
+    if name:match('%u') then
+      local m = file_marks[name]
+      return (m and m[1] == buf) and { m[2], m[3] } or { 0, 0 }
+    end
+    local m = buf_marks[buf] and buf_marks[buf][name]
+    return m and { m[1], m[2] } or { 0, 0 }
+  end
+  vim.api.nvim_buf_del_mark = function(buf, name)
+    buf = bufnr(buf)
+    check_name(name)
+    local t = name:match('%u') and file_marks or buf_marks[buf]
+    if t and t[name] then
+      t[name] = nil
+      return true
+    end
+    return false
+  end
+  function vim.fn.getmarklist(buf)
+    local out = {}
+    if buf == nil then
+      for _, name in ipairs(vim.tbl_keys(file_marks)) do
+        local m = file_marks[name]
+        out[#out + 1] = { mark = "'" .. name, pos = { m[1], m[2], m[3] + 1, 0 }, file = vim.api.nvim_buf_get_name(m[1]) }
+      end
+      table.sort(out, function(x, y) return x.mark < y.mark end)
+      return out
+    end
+    if type(buf) ~= 'number' or buf == 0 or not vim.api.nvim_buf_is_valid(buf) then
+      return out
+    end
+    local names = vim.tbl_keys(buf_marks[buf] or {})
+    table.sort(names)
+    for _, name in ipairs(names) do
+      local m = buf_marks[buf][name]
+      out[#out + 1] = { mark = "'" .. name, pos = { buf, m[1], m[2] + 1, 0 } }
+    end
+    out[#out + 1] = { mark = "'\"", pos = { buf, 1, 1, 0 } }
+    if vim.bo[buf].modified then
+      out[#out + 1] = { mark = "'.", pos = { buf, 1, 1, 0 } }
+    end
+    return out
+  end
+end
+
+-- winbufnr({nr}): {nr} is 0, a window number or a window id; -1 if invalid.
+function vim.fn.winbufnr(nr)
+  nr = tonumber(nr) or -1
+  if nr == 0 then
+    return vim.api.nvim_get_current_buf()
+  end
+  local wins = vim.api.nvim_list_wins()
+  local win = wins[nr] or (vim.api.nvim_win_is_valid(nr) and nr) or nil
+  return win and vim.api.nvim_win_get_buf(win) or -1
+end
+
+function vim.fn.win_findbuf(buf)
+  return vim.tbl_filter(function(w)
+    return vim.api.nvim_win_get_buf(w) == buf
+  end, vim.api.nvim_list_wins())
 end
 
 function vim.fn.getscriptinfo()
@@ -2682,6 +2813,168 @@ function vim.fn.findfile(name, path, _count)
     end
   end
   return ''
+end
+
+-- Native helpers behind vim.str_utfindex / vim.str_byteindex (C in Neovim).
+-- _str_utfindex(s [, index]): UTF-32 and UTF-16 counts of the characters that start
+-- within the first {index} bytes. _str_byteindex(s, index, use_utf16): byte length
+-- of the first {index} code units (ending a character it splits); nil past the end.
+local function utf_chars(s)
+  local out = {}
+  for start, ch in s:gmatch('()([%z\1-\127\194-\244][\128-\191]*)') do
+    out[#out + 1] = { start = start, len = #ch, wide = #ch == 4 }
+  end
+  return out
+end
+function vim._str_utfindex(s, index)
+  s = tostring(s)
+  index = index or #s
+  if index > #s then
+    return nil
+  end
+  local n32, n16 = 0, 0
+  for _, c in ipairs(utf_chars(s)) do
+    if c.start > index then
+      break
+    end
+    n32, n16 = n32 + 1, n16 + (c.wide and 2 or 1)
+  end
+  return n32, n16
+end
+function vim._str_byteindex(s, index, use_utf16)
+  s = tostring(s)
+  local units, bytes = 0, 0
+  if index == 0 then
+    return 0
+  end
+  for _, c in ipairs(utf_chars(s)) do
+    units = units + ((use_utf16 and c.wide) and 2 or 1)
+    bytes = c.start + c.len - 1
+    if units >= index then
+      return bytes
+    end
+  end
+  return nil
+end
+
+-- vim.str_byteindex / vim.str_utfindex: copied from Neovim's runtime editor.lua.
+local utfs = { ['utf-8'] = true, ['utf-16'] = true, ['utf-32'] = true }
+function vim.str_byteindex(s, encoding, index, strict_indexing)
+  if type(encoding) == 'number' then
+    -- Legacy support for old API
+    -- Parameters: ~
+    --   • {str}        (`string`)
+    --   • {index}      (`integer`)
+    --   • {use_utf16}  (`boolean?`)
+    vim.deprecate(
+      'vim.str_byteindex',
+      'vim.str_byteindex(s, encoding, index, strict_indexing)',
+      '1.0'
+    )
+    local old_index = encoding
+    local use_utf16 = index or false
+    return vim._str_byteindex(s, old_index, use_utf16) or error('index out of range')
+  end
+
+  -- Avoid vim.validate for performance.
+  if type(s) ~= 'string' or type(index) ~= 'number' then
+    vim.validate('s', s, 'string')
+    vim.validate('index', index, 'number')
+  end
+
+  local len = #s
+
+  if index == 0 or len == 0 then
+    return 0
+  end
+
+  if not utfs[encoding] then
+    vim.validate('encoding', encoding, function(v)
+      return utfs[v], 'invalid encoding'
+    end)
+  end
+
+  if strict_indexing ~= nil and type(strict_indexing) ~= 'boolean' then
+    vim.validate('strict_indexing', strict_indexing, 'boolean', true)
+  end
+  if strict_indexing == nil then
+    strict_indexing = true
+  end
+
+  if encoding == 'utf-8' then
+    if index > len then
+      return strict_indexing and error('index out of range') or len
+    end
+    return index
+  end
+  return vim._str_byteindex(s, index, encoding == 'utf-16')
+    or strict_indexing and error('index out of range')
+    or len
+end
+
+function vim.str_utfindex(s, encoding, index, strict_indexing)
+  if encoding == nil or type(encoding) == 'number' then
+    -- Legacy support for old API
+    -- Parameters: ~
+    --   • {str}    (`string`)
+    --   • {index}  (`integer?`)
+    vim.deprecate(
+      'vim.str_utfindex',
+      'vim.str_utfindex(s, encoding, index, strict_indexing)',
+      '1.0'
+    )
+    local old_index = encoding
+    local col32, col16 = vim._str_utfindex(s, old_index) --[[@as integer,integer]]
+    if not col32 or not col16 then
+      error('index out of range')
+    end
+    -- Return (multiple): ~
+    --     (`integer`) UTF-32 index
+    --     (`integer`) UTF-16 index
+    return col32, col16
+  end
+
+  if type(s) ~= 'string' or (index ~= nil and type(index) ~= 'number') then
+    vim.validate('s', s, 'string')
+    vim.validate('index', index, 'number', true)
+  end
+
+  if not index then
+    index = math.huge
+    strict_indexing = false
+  end
+
+  if index == 0 then
+    return 0
+  end
+
+  if not utfs[encoding] then
+    vim.validate('encoding', encoding, function(v)
+      return utfs[v], 'invalid encoding'
+    end)
+  end
+
+  if strict_indexing ~= nil and type(strict_indexing) ~= 'boolean' then
+    vim.validate('strict_indexing', strict_indexing, 'boolean', true)
+  end
+  if strict_indexing == nil then
+    strict_indexing = true
+  end
+
+  if encoding == 'utf-8' then
+    local len = #s
+    return index <= len and index or (strict_indexing and error('index out of range') or len)
+  end
+  local col32, col16 = vim._str_utfindex(s, index) --[[@as integer?,integer?]]
+  local col = encoding == 'utf-16' and col16 or col32
+  if col then
+    return col
+  end
+  if strict_indexing then
+    error('index out of range')
+  end
+  local max32, max16 = vim._str_utfindex(s)--[[@as integer integer]]
+  return encoding == 'utf-16' and max16 or max32
 end
 
 function vim.fn.environ()
@@ -3574,10 +3867,24 @@ do
     end
   end
 
+  -- b:changedtick: Neovim starts the first buffer at 2 and new ones at 1; every
+  -- change adds 1. Kept in the buffer's variables so vim.b and nvim_buf_get_var see it.
+  local function bump_tick(id)
+    local vars = buffer_var_table(id)
+    vars.changedtick = (vars.changedtick or (id == 1 and 2 or 1)) + 1
+  end
+  vim.api.nvim_buf_get_changedtick = function(buf)
+    local id = check_buf(buf)
+    local vars = buffer_var_table(id)
+    vars.changedtick = vars.changedtick or (id == 1 and 2 or 1)
+    return vars.changedtick
+  end
+
   local raw_set_lines = vim.api.nvim_buf_set_lines
   vim.api.nvim_buf_set_lines = function(buf, start, end_, strict, lines)
     local id = check_buf(buf)
     local result = raw_set_lines(id, start, end_, strict, lines)
+    bump_tick(id)
     local count = 0
     if type(lines) == 'table' then
       for _ in pairs(lines) do
@@ -3586,6 +3893,35 @@ do
     end
     fire_buf_attach(id, start, end_, start + count)
     return result
+  end
+
+  -- nvim_buf_set_text: replace a (0-based, end-exclusive col) range with {replacement} lines.
+  vim.api.nvim_buf_set_text = function(buf, start_row, start_col, end_row, end_col, replacement)
+    local id = check_buf(buf)
+    local n = vim.api.nvim_buf_line_count(id)
+    if start_row < 0 then start_row = n + start_row end
+    if end_row < 0 then end_row = n + end_row end
+    if start_row > end_row or (start_row == end_row and start_col > end_col) then
+      api_error("'start' is higher than 'end'")
+    end
+    if end_row >= n then
+      api_error("Invalid 'end_row': out of range")
+    end
+    local old = vim.api.nvim_buf_get_lines(id, start_row, end_row + 1, true)
+    local first, last = old[1], old[#old]
+    if start_col > #first or end_col > #last then
+      api_error("Invalid 'start_col' or 'end_col': out of range")
+    end
+    local new = {}
+    for i, l in ipairs(replacement) do
+      new[i] = l
+    end
+    if #new == 0 then
+      new[1] = ''
+    end
+    new[1] = first:sub(1, start_col) .. new[1]
+    new[#new] = new[#new] .. last:sub(end_col + 1)
+    vim.api.nvim_buf_set_lines(id, start_row, end_row + 1, true, new)
   end
 
   vim.api.nvim_buf_get_short_name = function(buf, _)
@@ -5912,6 +6248,11 @@ end
 
 -- Built-in highlight groups, as Neovim has before any colorscheme.
 vim._hl_reset()
+
+-- vim.regex (Neovim: Vim's C regex engine).
+function vim.regex(pattern)
+  return require('vim._regex').new(tostring(pattern))
+end
 
 -- vim.diff (Neovim: xdiff in C); vim.text.diff calls it.
 function vim.diff(a, b, opts)

@@ -323,6 +323,7 @@ pub fn main(init: std.process.Init) !void {
         // the -c commands in order (Neovim CLI semantics).
         _ = startupEditor(L, init_file, clean);
         if (file_arg) |path| {
+            _ = execVimCommand(L, "lua vim._startup_edit = true"); // file-arg event order
             const cmd = std.fmt.allocPrint(gpa, "edit {s}", .{path}) catch unreachable;
             defer gpa.free(cmd);
             _ = execVimCommand(L, cmd);
@@ -339,6 +340,8 @@ pub fn main(init: std.process.Init) !void {
     // Neovim's order: BufEnter for the first buffer, the -c commands, then VimEnter
     // (unless a -c command quit), and UIEnter only once a UI is attached. `-l` gets none.
     if (lua_script == null) {
+        // A file argument already got BufWinEnter from :edit; the empty buffer gets it here.
+        if (file_arg == null) fireAutocmd(L, "BufWinEnter");
         fireAutocmd(L, "BufEnter");
         var quit_requested = false;
         for (cmds.items) |cmd| {
@@ -541,6 +544,10 @@ fn registerVimGlobal(L: *c.lua_State) !void {
     c.lua_setfield(L, -2, "cwd");
     c.lua_pushcfunction(L, luaUvChdir);
     c.lua_setfield(L, -2, "chdir");
+    c.lua_pushcfunction(L, luaUvOsGetpid);
+    c.lua_setfield(L, -2, "os_getpid");
+    c.lua_pushcfunction(L, luaUvOsGetppid);
+    c.lua_setfield(L, -2, "os_getppid");
     c.lua_pushcfunction(L, luaUvOsHomedir);
     c.lua_setfield(L, -2, "os_homedir");
     c.lua_pushcfunction(L, luaUvExepath);
@@ -600,6 +607,7 @@ const embedded_lua_modules = [_]struct { name: [:0]const u8, source: [:0]const u
     .{ .name = "vim._remote", .source = @embedFile("lua/vim/_remote.lua") },
     .{ .name = "vim._default_hl", .source = @embedFile("lua/vim/_default_hl.lua") },
     .{ .name = "vim._diff", .source = @embedFile("lua/vim/_diff.lua") },
+    .{ .name = "vim._regex", .source = @embedFile("lua/vim/_regex.lua") },
 };
 
 /// Expose the embedded modules as a global table that prelude.lua turns into a
@@ -2132,6 +2140,18 @@ fn luaUvCwd(L: ?*c.lua_State) callconv(.c) c_int {
     }
     const len = std.mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
     c.lua_pushlstring(LS, &buf, len);
+    return 1;
+}
+
+fn luaUvOsGetpid(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    c.lua_pushinteger(LS, c.uv_os_getpid());
+    return 1;
+}
+
+fn luaUvOsGetppid(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    c.lua_pushinteger(LS, c.uv_os_getppid());
     return 1;
 }
 

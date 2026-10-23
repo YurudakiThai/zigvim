@@ -1874,8 +1874,23 @@ local function insert_tab()
   end
 end
 
+-- InsertEnter/InsertLeave with the API cursor synced (blink.cmp, autopairs, ... load
+-- on InsertEnter). shortcut: no ModeChanged / TextChangedI yet.
+local function insert_event(event)
+  pcall(api.nvim_win_set_cursor, 0, { S.row, S.col })
+  local ok, e = pcall(vim._exec_autocmds, event, {})
+  if not ok then
+    err(tostring(e))
+  end
+  local pos_ok, pos = pcall(api.nvim_win_get_cursor, 0)
+  if pos_ok then
+    S.row, S.col = pos[1], pos[2]
+  end
+end
+
 function insert_mode()
   S.mode = 'i'
+  insert_event('InsertEnter')
   while not S.quit do
     local k = getkey_cmd()
     if k == '<Esc>' or k == '<C-c>' then
@@ -1936,6 +1951,7 @@ function insert_mode()
     end
     clamp()
   end
+  insert_event('InsertLeave')
   S.mode = 'n'
   S.changed = true
   local line = getline(S.row)
