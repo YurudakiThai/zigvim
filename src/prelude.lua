@@ -4620,14 +4620,64 @@ do
     return (reg == nil or reg == '') and '"' or tostring(reg)
   end
 
+  -- '+' and '*' use the OS clipboard when a tool is found (subset of Neovim's provider order).
+  -- shortcut: '*' is the clipboard too (no X11 primary selection); upgrade if someone needs it.
+  local clip_tools = {
+    { name = 'pbcopy', copy = 'pbcopy', paste = 'pbpaste' },
+    { name = 'wl-copy', env = 'WAYLAND_DISPLAY', copy = 'wl-copy --type text/plain', paste = 'wl-paste --no-newline' },
+    { name = 'xclip', env = 'DISPLAY', copy = 'xclip -i -selection clipboard', paste = 'xclip -o -selection clipboard' },
+    { name = 'xsel', env = 'DISPLAY', copy = 'xsel -i -b', paste = 'xsel -o -b' },
+    { name = 'win32yank.exe', copy = 'win32yank.exe -i --crlf', paste = 'win32yank.exe -o --lf' },
+  }
+  local clip -- false once looked up and none found
+  local function clip_tool()
+    if clip == nil then
+      clip = false
+      for _, t in ipairs(clip_tools) do
+        if (not t.env or os.getenv(t.env)) and vim.fn.executable(t.name) == 1 then
+          clip = t
+          break
+        end
+      end
+    end
+    return clip
+  end
+
+  vim.fn['provider#clipboard#Executable'] = function()
+    local t = clip_tool()
+    return t and t.name or ''
+  end
+
   -- Registers hold { text = lines, linewise = bool }; the TUI shares this store.
-  -- shortcut: '+' and '*' are plain internal registers, no system clipboard provider.
   function vim._reg_get(reg)
-    return registers[reg_name(reg)]
+    reg = reg_name(reg)
+    local t = (reg == '+' or reg == '*') and clip_tool()
+    if t then
+      local f = io.popen(t.paste, 'r')
+      local text = f and f:read('*a') or ''
+      if f then
+        f:close()
+      end
+      local last = registers[reg]
+      -- Our own last copy keeps its register type; anything else is typed by its trailing newline.
+      if last and table.concat(last.text, '\n') .. (last.linewise and '\n' or '') == text then
+        return last
+      end
+      local lw = text:sub(-1) == '\n'
+      registers[reg] = { text = vim.split(lw and text:sub(1, -2) or text, '\n', { plain = true }), linewise = lw }
+    end
+    return registers[reg]
   end
 
   function vim._reg_set(reg, lines, linewise)
-    registers[reg_name(reg)] = { text = lines, linewise = linewise and true or false }
+    reg = reg_name(reg)
+    registers[reg] = { text = lines, linewise = linewise and true or false }
+    local t = (reg == '+' or reg == '*') and clip_tool()
+    local f = t and io.popen(t.copy, 'w')
+    if f then
+      f:write(table.concat(lines, '\n') .. (linewise and '\n' or ''))
+      f:close()
+    end
   end
 
   -- The register an unprefixed yank/put uses, following 'clipboard'.
@@ -4642,7 +4692,7 @@ do
   end
 
   function vim.fn.getreg(reg, _, list)
-    local r = registers[reg_name(reg)]
+    local r = vim._reg_get(reg)
     if list and list ~= 0 then
       return r and vim.deepcopy(r.text) or {}
     end
@@ -4672,7 +4722,7 @@ do
   end
 
   function vim.fn.getregtype(reg)
-    local r = registers[reg_name(reg)]
+    local r = vim._reg_get(reg)
     if r == nil then
       return ''
     end
@@ -4811,7 +4861,7 @@ do
       ttyout = true,
       gui = false,
       gui_running = false,
-      clipboard = false,
+      clipboard = vim.fn['provider#clipboard#Executable']() ~= '',
       python = false,
       python3 = false,
       vim9script = false,
