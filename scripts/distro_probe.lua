@@ -149,6 +149,23 @@ out.modules = modules
 out.rtp_count = #safe(vim.api.nvim_list_runtime_paths)
 out.cwd_is_dir = vim.fn.isdirectory(vim.fn.getcwd()) == 1
 
+
+-- Highlight groups (sample important ones used by catppuccin and UI)
+local hl_groups = {
+  'Normal', 'NormalFloat', 'Comment', 'Constant', 'String', 'Identifier',
+  'Function', 'Statement', 'PreProc', 'Type', 'Special', 'Visual', 'Search',
+  'IncSearch', 'StatusLine', 'StatusLineNC', 'TabLine', 'TabLineFill',
+  'Pmenu', 'PmenuSel', 'CursorLine', 'CursorColumn', 'LineNr', 'CursorLineNr',
+  'NonText', 'EndOfBuffer', 'SignColumn', 'ColorColumn',
+}
+out.highlights = {}
+for _, name in ipairs(hl_groups) do
+  local hl = safe(vim.api.nvim_get_hl, 0, { name = name })
+  if type(hl) == 'table' then
+    out.highlights[name] = hl
+  end
+end
+
 local path = os.getenv('PROBE_OUT')
 if path and path ~= '' then
   local f = assert(io.open(path, 'w'))

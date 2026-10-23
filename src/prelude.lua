@@ -3765,6 +3765,17 @@ do
         if next(cterm) ~= nil then
           group.cterm = cterm
         end
+      else
+        -- Auto-generate cterm from gui attributes (Neovim behavior)
+        local cterm = {}
+        for _, key in ipairs(attr_keys) do
+          if group[key] then
+            cterm[key] = group[key]
+          end
+        end
+        if next(cterm) ~= nil then
+          group.cterm = cterm
+        end
       end
       if val.default then
         group.default = true
