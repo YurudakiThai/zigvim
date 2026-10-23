@@ -529,6 +529,8 @@ fn registerVimGlobal(L: *c.lua_State) !void {
     c.lua_setfield(L, -2, "os_uname");
     c.lua_pushcfunction(L, luaUvCwd);
     c.lua_setfield(L, -2, "cwd");
+    c.lua_pushcfunction(L, luaUvChdir);
+    c.lua_setfield(L, -2, "chdir");
     c.lua_pushcfunction(L, luaUvOsHomedir);
     c.lua_setfield(L, -2, "os_homedir");
     c.lua_pushcfunction(L, luaUvExepath);
@@ -1464,6 +1466,20 @@ fn pushField(L: *c.lua_State, name: [*:0]const u8, buf: *const [256]u8) void {
     const len = std.mem.indexOfScalar(u8, buf, 0) orelse buf.len;
     c.lua_pushlstring(L, buf, len);
     c.lua_setfield(L, -2, name);
+}
+
+// vim.uv.chdir(path): true, or nil + error name like luv.
+fn luaUvChdir(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const path = c.luaL_checklstring(LS, 1, null);
+    const rc = c.uv_chdir(path);
+    if (rc != 0) {
+        c.lua_pushnil(LS);
+        c.lua_pushstring(LS, c.uv_err_name(rc));
+        return 2;
+    }
+    c.lua_pushboolean(LS, 1);
+    return 1;
 }
 
 fn luaUvCwd(L: ?*c.lua_State) callconv(.c) c_int {

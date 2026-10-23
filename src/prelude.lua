@@ -656,6 +656,13 @@ end
 local StringOption = {}
 StringOption.__index = StringOption
 
+-- vim.opt.<boolean/number option> is an Option object too; :get() returns the value.
+local ScalarOption = {}
+ScalarOption.__index = ScalarOption
+function ScalarOption:get()
+  return option_mt.__index(nil, self._name)
+end
+
 local function string_option_raw(name)
   return option_mt.__index(nil, name)
 end
@@ -765,6 +772,8 @@ vim.opt = setmetatable({}, {
     local value = option_mt.__index(t, k)
     if type(value) == 'string' then
       return setmetatable({ _name = option_aliases[k] or k }, StringOption)
+    elseif value ~= nil then
+      return setmetatable({ _name = option_aliases[k] or k }, ScalarOption)
     end
     return value
   end,
@@ -1094,6 +1103,21 @@ end
 
 function vim.fn.getcwd()
   return vim.uv.cwd()
+end
+
+-- shortcut: one global cwd (no window/tab-local :lcd/:tcd) and no DirChanged event.
+function vim.fn.chdir(dir)
+  local old = vim.uv.cwd()
+  if not vim.uv.chdir(vim.fn.expand(tostring(dir))) then
+    error('Vim:E344: Can\'t find directory "' .. tostring(dir) .. '" in cdpath', 0)
+  end
+  return old
+end
+
+vim.api.nvim_set_current_dir = function(dir)
+  if not vim.uv.chdir(vim.fn.expand(tostring(dir))) then
+    error('Failed to change directory', 0)
+  end
 end
 
 local function basename(path)
@@ -1712,6 +1736,12 @@ local function exec_cmd(cmd)
     or name == 'onoremenu' or name == 'tnoremenu'
     or name == 'unmenu' or name == 'aunmenu' then
     -- Accepted and ignored: no Vimscript engine / highlighter / menu system behind these yet.
+  elseif name == 'autocmd' or name == 'au' or name == 'autocmd!' or name == 'au!' then
+    vim._ex_autocmd(name:sub(-1) == '!', rest)
+  elseif name == 'cd' or name == 'lcd' or name == 'tcd' or name == 'chdir' then
+    vim.fn.chdir(rest == '' and vim.env.HOME or rest)
+  elseif name == 'noh' or name == 'nohlsearch' or name == 'redraw' or name == 'redraw!' then
+    -- nothing to do: the TUI redraws after every key and draws no search highlight
   elseif name == 'lsp' then
     require('vim._core.ex_cmd').ex_lsp(rest)
   elseif name == 'highlight' or name == 'hi' or name == 'highlight!' or name == 'hi!' then
@@ -1774,15 +1804,12 @@ local function exec_cmd(cmd)
     end
     chunk()
   elseif name == 'let' then
-    local var, expr = rest:match('^(.-)%s*=%s*(.*)$')
-    if var == 'g:' or var:sub(1, 2) ~= 'g:' then
-      error('E121: Undefined variable: ' .. tostring(var))
+    -- shortcut: plain `=` into g:/b:/w:/t:/v: only (no +=, unpacking, options or registers).
+    local scope, var, expr = rest:match('^([gbwtv]):([%w_#]+)%s*=%s*(.*)$')
+    if not scope then
+      error('E121: Undefined variable: ' .. tostring(rest:match('^(%S+)')))
     end
-    local chunk, err = loadstring('return ' .. expr)
-    if not chunk then
-      error(err)
-    end
-    vim.g[var:sub(3)] = chunk()
+    vim[scope][var] = vim.api.nvim_eval(expr)
   elseif name == 'setf' or name == 'setfiletype' then
     -- :setf [FALLBACK] name / :setfiletype name. Setting 'filetype' fires
     -- FileType (see buf_opt_set), which drives ftplugin/indent loading.
@@ -1807,12 +1834,7 @@ local function exec_cmd(cmd)
       vim.bo.filetype = first
     end
   elseif name == 'echo' then
-    local chunk, err = loadstring('return ' .. rest)
-    if not chunk then
-      error(err)
-    end
-    local value = chunk()
-    io.stdout:write(tostring(value) .. '\n')
+    io.stdout:write(tostring(vim.api.nvim_eval(rest)) .. '\n')
   elseif vim._user_commands
     and (vim._user_commands[name] or (name:sub(-1) == '!' and vim._user_commands[name:sub(1, -2)])) then
     local bang = name:sub(-1) == '!'
@@ -1858,6 +1880,7 @@ end
 
 local function cmd_call(cmd)
   exec_lines(cmd, true)
+  return '' -- Neovim's vim.cmd returns the (empty, uncaptured) output
 end
 
 -- vim.cmd is both callable (vim.cmd('set x')) and indexable
@@ -1939,6 +1962,19 @@ end
 
 vim.api.nvim_buf_is_loaded = function(buf)
   return vim.api.nvim_buf_is_valid(buf)
+end
+
+-- The C side only allocates the buffer; apply nvim_create_buf's {listed} and {scratch}.
+local create_buf = vim.api.nvim_create_buf
+vim.api.nvim_create_buf = function(listed, scratch)
+  local buf = create_buf(listed, scratch)
+  if buf and buf > 0 then
+    vim.bo[buf].buflisted = listed and true or false
+    if scratch then
+      vim.bo[buf].buftype, vim.bo[buf].bufhidden, vim.bo[buf].swapfile = 'nofile', 'hide', false
+    end
+  end
+  return buf
 end
 
 local buffer_attach_callbacks = {}
@@ -2415,6 +2451,222 @@ function vim.api.nvim_set_decoration_provider(ns_id, opts)
   vim._decoration_providers[ns_id] = opts
 end
 
+local function nonblank(lnum, step)
+  lnum = tonumber(lnum) or 0
+  local n = vim.api.nvim_buf_line_count(0)
+  if lnum < 1 or lnum > n then
+    return 0
+  end
+  for l = lnum, step > 0 and n or 1, step do
+    if vim.api.nvim_buf_get_lines(0, l - 1, l, false)[1]:find('%S') then
+      return l
+    end
+  end
+  return 0
+end
+function vim.fn.prevnonblank(lnum)
+  return nonblank(lnum, -1)
+end
+function vim.fn.nextnonblank(lnum)
+  return nonblank(lnum, 1)
+end
+
+-- :autocmd[!] [group] {events} {pat} [++once] [++nested] {cmd}
+-- shortcut: no `<buffer>` patterns and no listing (`:autocmd` without a command).
+function vim._ex_autocmd(bang, rest)
+  local words = {}
+  for w in rest:gmatch('%S+') do
+    words[#words + 1] = w
+  end
+  local group
+  if words[1] and pcall(vim.api.nvim_get_autocmds, { group = words[1] }) then
+    group = table.remove(words, 1)
+  end
+  local events, pat = words[1], words[2]
+  local cmd = rest:match('^%s*' .. (group and vim.pesc(group) .. '%s+' or '') .. (events and vim.pesc(events) .. '%s*' or '')
+    .. (pat and vim.pesc(pat) .. '%s*' or '') .. '(.*)$') or ''
+  if bang then
+    local opts = { group = group }
+    if events and events ~= '*' then
+      opts.event = vim.split(events, ',')
+    end
+    if pat then
+      opts.pattern = pat
+    end
+    pcall(vim.api.nvim_clear_autocmds, opts)
+  end
+  if not events or not pat or cmd == '' then
+    return
+  end
+  local once, nested = false, false
+  while true do
+    local flag, more = cmd:match('^%+%+(%a+)%s*(.*)$')
+    if flag == 'once' then
+      once, cmd = true, more
+    elseif flag == 'nested' then
+      nested, cmd = true, more
+    else
+      break
+    end
+  end
+  vim.api.nvim_create_autocmd(vim.split(events, ','), {
+    group = group, pattern = vim.split(pat, ','), command = cmd, once = once, nested = nested,
+  })
+end
+
+-- indent({lnum}): -1 for a non-number or out-of-range line (what Neovim returns from Lua).
+function vim.fn.indent(lnum)
+  lnum = tonumber(lnum)
+  if not lnum or lnum < 1 or lnum > vim.api.nvim_buf_line_count(0) then
+    return -1
+  end
+  local line = vim.api.nvim_buf_get_lines(0, lnum - 1, lnum, false)[1]
+  local ts, col = vim.bo.tabstop, 0
+  for ch in line:match('^[ \t]*'):gmatch('.') do
+    col = ch == '\t' and (math.floor(col / ts) + 1) * ts or col + 1
+  end
+  return col
+end
+
+-- shortcut: one non-floating window per tab; real floats come with window support.
+vim.api.nvim_win_get_config = function(win)
+  if not vim.api.nvim_win_is_valid(win) then
+    error('Invalid window id: ' .. tostring(win), 0)
+  end
+  return {
+    external = false, focusable = true, hide = false, mouse = true, relative = '', split = 'left',
+    style = '', height = vim.api.nvim_win_get_height(win), width = vim.api.nvim_win_get_width(win),
+  }
+end
+
+-- getbufinfo([{buf}] | [{dict}]): shortcut: lastused is always 0.
+function vim.fn.getbufinfo(arg)
+  local bufs = vim.api.nvim_list_bufs()
+  if type(arg) == 'number' or type(arg) == 'string' then
+    local b = vim.fn.bufnr(arg)
+    bufs = (b > 0 and vim.api.nvim_buf_is_valid(b)) and { b } or {}
+  end
+  local filt = type(arg) == 'table' and arg or {}
+  local cur = vim.api.nvim_get_current_buf()
+  local out = {}
+  for _, b in ipairs(bufs) do
+    local wins = vim.tbl_filter(function(w)
+      return vim.api.nvim_win_get_buf(w) == b
+    end, vim.api.nvim_list_wins())
+    local info = {
+      bufnr = b,
+      changed = vim.bo[b].modified and 1 or 0,
+      changedtick = vim.b[b].changedtick or 0,
+      command = 0,
+      hidden = (#wins == 0 and vim.api.nvim_buf_is_loaded(b)) and 1 or 0,
+      lastused = 0,
+      linecount = vim.api.nvim_buf_line_count(b),
+      listed = vim.bo[b].buflisted and 1 or 0,
+      lnum = b == cur and vim.api.nvim_win_get_cursor(0)[1] or 1,
+      loaded = vim.api.nvim_buf_is_loaded(b) and 1 or 0,
+      name = vim.api.nvim_buf_get_name(b),
+      variables = vim.b[b],
+      windows = wins,
+    }
+    if not ((filt.buflisted == 1 and info.listed == 0) or (filt.bufloaded == 1 and info.loaded == 0)
+      or (filt.bufmodified == 1 and info.changed == 0)) then
+      out[#out + 1] = info
+    end
+  end
+  return out
+end
+
+-- SHA-256 (FIPS 180-4) over LuaJIT's bit library.
+do
+  local band, bor, bxor, bnot = bit.band, bit.bor, bit.bxor, bit.bnot
+  local rrot, rshift, tobit = bit.ror, bit.rshift, bit.tobit
+  local K = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+  }
+  function vim.fn.sha256(msg)
+    msg = tostring(msg)
+    local len = #msg
+    msg = msg .. '\128' .. string.rep('\0', (55 - len) % 64)
+    local bits = len * 8
+    for i = 7, 0, -1 do
+      msg = msg .. string.char(math.floor(bits / 2 ^ (8 * i)) % 256)
+    end
+    local h = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 }
+    local w = {}
+    for chunk = 1, #msg, 64 do
+      for i = 0, 15 do
+        local a, b, c, d = msg:byte(chunk + i * 4, chunk + i * 4 + 3)
+        w[i] = bor(bit.lshift(a, 24), bit.lshift(b, 16), bit.lshift(c, 8), d)
+      end
+      for i = 16, 63 do
+        local s0 = bxor(rrot(w[i - 15], 7), rrot(w[i - 15], 18), rshift(w[i - 15], 3))
+        local s1 = bxor(rrot(w[i - 2], 17), rrot(w[i - 2], 19), rshift(w[i - 2], 10))
+        w[i] = tobit(w[i - 16] + s0 + w[i - 7] + s1)
+      end
+      local a, b, c, d, e, f, g, hh = unpack(h)
+      for i = 0, 63 do
+        local S1 = bxor(rrot(e, 6), rrot(e, 11), rrot(e, 25))
+        local ch = bxor(band(e, f), band(bnot(e), g))
+        local t1 = tobit(hh + S1 + ch + K[i + 1] + w[i])
+        local S0 = bxor(rrot(a, 2), rrot(a, 13), rrot(a, 22))
+        local maj = bxor(band(a, b), band(a, c), band(b, c))
+        hh, g, f, e, d, c, b, a = g, f, e, tobit(d + t1), c, b, a, tobit(t1 + S0 + maj)
+      end
+      for i, v in ipairs({ a, b, c, d, e, f, g, hh }) do
+        h[i] = tobit(h[i] + v)
+      end
+    end
+    local out = {}
+    for i = 1, 8 do
+      out[i] = bit.tohex(h[i], 8)
+    end
+    return table.concat(out)
+  end
+end
+
+-- findfile({name} [, {path} [, {count}]]): first match in 'path'-style dirs; "dir;" searches
+-- upward from dir. shortcut: no "**" globs, stop dirs after ";", or count/list results.
+function vim.fn.findfile(name, path, _count)
+  name = tostring(name)
+  local function hit(p)
+    local st = vim.uv.fs_stat(p)
+    return st and st.type ~= 'directory'
+  end
+  if name:sub(1, 1) == '/' then
+    return hit(name) and name or ''
+  end
+  local cwd = vim.fn.getcwd()
+  local bufdir = vim.fn.expand('%:p:h')
+  local dirs = (path == nil or path == '') and (vim.o.path or '.,,') or path
+  for _, entry in ipairs(vim.split(dirs, ',', { plain = true })) do
+    local upward = entry:sub(-1) == ';'
+    local dir = upward and entry:sub(1, -2) or entry
+    if dir == '.' then
+      dir = bufdir ~= '' and bufdir or cwd
+    elseif dir == '' then
+      dir = cwd
+    elseif dir:sub(1, 1) ~= '/' then
+      dir = vim.fs.normalize(cwd .. '/' .. dir)
+    end
+    while dir do
+      local p = (dir == '/' and '' or dir) .. '/' .. name
+      if hit(p) then
+        return p
+      end
+      local parent = upward and vim.fs.dirname(dir) or nil
+      dir = parent ~= dir and parent or nil
+    end
+  end
+  return ''
+end
+
 function vim.fn.environ()
   return vim.uv.os_environ()
 end
@@ -2703,6 +2955,9 @@ vim.v = setmetatable({}, {
 })
 vim.w = setmetatable({}, {
   __index = function(_, k)
+    if type(k) == 'number' then -- vim.w[id].name
+      return var_table('w', k == 0 and vim.api.nvim_get_current_win() or k)
+    end
     return var_table('w', vim.api.nvim_get_current_win())[k]
   end,
   __newindex = function(_, k, v)
@@ -2711,6 +2966,9 @@ vim.w = setmetatable({}, {
 })
 vim.t = setmetatable({}, {
   __index = function(_, k)
+    if type(k) == 'number' then -- vim.t[id].name
+      return var_table('t', k == 0 and vim.api.nvim_get_current_tabpage() or k)
+    end
     return var_table('t', vim.api.nvim_get_current_tabpage())[k]
   end,
   __newindex = function(_, k, v)
@@ -2755,6 +3013,35 @@ end
 vim.api.nvim_tabpage_del_var = function(tab, name)
   tab = tab == 0 and vim.api.nvim_get_current_tabpage() or tab
   del_var('t', tab, name)
+end
+
+-- shortcut: zigvim has one tabpage holding every window; real multiple tabs (and
+-- nvim_open_tabpage) come with tab support.
+local function check_tab(tab)
+  if not vim.api.nvim_tabpage_is_valid(tab) then
+    api_error('Invalid tabpage id: ' .. tostring(tab))
+  end
+end
+local function check_win(win)
+  if not vim.api.nvim_win_is_valid(win) then
+    api_error('Invalid window id: ' .. tostring(win))
+  end
+end
+vim.api.nvim_tabpage_list_wins = function(tab)
+  check_tab(tab)
+  return vim.api.nvim_list_wins()
+end
+vim.api.nvim_win_get_tabpage = function(win)
+  check_win(win)
+  return vim.api.nvim_get_current_tabpage()
+end
+vim.api.nvim_tabpage_set_win = function(tab, win)
+  check_tab(tab)
+  check_win(win)
+  vim.api.nvim_set_current_win(win)
+end
+vim.api.nvim_set_current_tabpage = function(tab)
+  check_tab(tab)
 end
 
 -- ------------------------------------------------------------- options API
@@ -3033,6 +3320,36 @@ vim.api.nvim_get_keymap = function(mode)
     end
   end
   return copy
+end
+
+-- shortcut: mode '' looks in 'n' only, abbreviations (abbr) are not supported.
+function vim.fn.maparg(name, mode, abbr, dict)
+  mode = (mode == nil or mode == '') and 'n' or mode
+  local want = normalize_lhs(tostring(name))
+  local found
+  for _, list in ipairs({ vim.api.nvim_buf_get_keymap(0, mode), vim.api.nvim_get_keymap(mode) }) do
+    for _, m in ipairs(list) do
+      if m.lhs == want then
+        found = m
+        break
+      end
+    end
+    if found then
+      break
+    end
+  end
+  if dict and dict ~= 0 then
+    if not found then
+      return {}
+    end
+    local d = vim.deepcopy(found)
+    d.abbr, d.lhsraw, d.scriptversion = 0, found.lhs, 1
+    return d
+  end
+  if not found then
+    return ''
+  end
+  return found.callback and '<Lua callback>' or found.rhs
 end
 
 vim.api.nvim_del_keymap = function(mode, lhs)
@@ -3693,6 +4010,13 @@ do
 
   vim.api.nvim_clear_autocmds = function(opts)
     opts = opts or {}
+    if type(opts.group) == 'string' then -- records hold group ids
+      local id = state.groups[opts.group]
+      if not id then
+        api_error("Invalid 'group': '" .. opts.group .. "'")
+      end
+      opts = vim.tbl_extend('force', opts, { group = id })
+    end
     local event_filter = opts.event and validate_events(opts.event) or nil
     local pattern_filter = opts.pattern and as_list(opts.pattern) or nil
     for id, record in pairs(state.items) do
@@ -3936,6 +4260,25 @@ do
     end
   end
 
+  -- Deprecated, still used by plugins: resolved attrs with foreground/background/special.
+  vim.api.nvim_get_hl_by_name = function(name, rgb)
+    if vim.fn.hlexists(name) == 0 then
+      error("Invalid highlight name: '" .. tostring(name) .. "'", 0)
+    end
+    local hl = vim.api.nvim_get_hl(0, { name = name, link = false })
+    local src = rgb and hl or (hl.cterm or {})
+    local out = {}
+    for _, key in ipairs(attr_keys) do
+      out[key] = src[key]
+    end
+    if rgb then
+      out.foreground, out.background, out.special = hl.fg, hl.bg, hl.sp
+    else
+      out.foreground, out.background = hl.ctermfg, hl.ctermbg
+    end
+    return out
+  end
+
   function vim.fn.hlexists(name)
     name = tostring(name)
     if highlight_groups[name] or hl_ids[name] then
@@ -4046,10 +4389,25 @@ do
           end,
           register = none,
         },
-        query = { get = none, parse = none, set = none },
+        query = {
+          get = none, parse = none, set = none,
+          add_predicate = none, add_directive = none,
+          list_predicates = function() return {} end, list_directives = function() return {} end,
+        },
       }
       rawset(t, k, stub)
       return stub
+    end
+    -- Like vim._init_packages: vim.uri_* from vim.uri, inspect_pos/show_pos from vim._inspector.
+    if type(k) == 'string' and k:sub(1, 4) == 'uri_' then
+      local val = require('vim.uri')[k]
+      if val ~= nil then
+        rawset(t, k, val)
+        return val
+      end
+    elseif k == 'inspect_pos' or k == 'show_pos' then
+      require('vim._inspector')
+      return rawget(t, k)
     end
     if old_index then
       return old_index(t, k)
@@ -4738,8 +5096,52 @@ do
     return count
   end
 
+  -- Tabs expand to the next 'tabstop' counted from screen column {col} (0-based).
   function vim.fn.strdisplaywidth(s, col)
-    return vim.api.nvim_strwidth(tostring(s))
+    s = tostring(s)
+    if not s:find('\t', 1, true) then
+      return vim.api.nvim_strwidth(s)
+    end
+    local start = tonumber(col) or 0
+    local cur, ts = start, vim.bo.tabstop
+    for ch in s:gmatch('[%z\1-\127\194-\244][\128-\191]*') do
+      cur = cur + (ch == '\t' and ts - cur % ts or vim.api.nvim_strwidth(ch))
+    end
+    return cur - start
+  end
+
+  -- virtcol({expr} [, {list}]): last screen column of the character at {expr}
+  -- ('.', '$', "'m" or {lnum, col}); with {list}, {first, last}. 0 for an invalid line.
+  function vim.fn.virtcol(expr, list)
+    local lnum, col
+    if type(expr) == 'table' then
+      lnum, col = tonumber(expr[1]), expr[2]
+    elseif expr == '.' or expr == '$' then
+      local c = vim.api.nvim_win_get_cursor(0)
+      lnum, col = c[1], expr == '$' and '$' or c[2] + 1
+    elseif type(expr) == 'string' and expr:sub(1, 1) == "'" then
+      local m = vim.api.nvim_buf_get_mark(0, expr:sub(2, 2))
+      lnum, col = m[1], m[2] + 1
+    end
+    local wrap = function(a, b)
+      return (list and list ~= 0) and { a, b } or b
+    end
+    if not lnum or lnum < 1 or lnum > vim.api.nvim_buf_line_count(0) then
+      return wrap(0, 0)
+    end
+    local line = vim.api.nvim_buf_get_lines(0, lnum - 1, lnum, false)[1]
+    col = tonumber(col)
+    if not col or col > #line then
+      local w = vim.fn.strdisplaywidth(line) + 1
+      return wrap(w, w)
+    end
+    local start = math.max(1, col)
+    while start > 1 and (line:byte(start) or 0) >= 0x80 and line:byte(start) < 0xC0 do
+      start = start - 1 -- back to the first byte of a multi-byte character
+    end
+    local before = vim.fn.strdisplaywidth(line:sub(1, start - 1))
+    local ch = line:match('^[%z\1-\127\194-\244][\128-\191]*', start) or ''
+    return wrap(before + 1, math.max(before + 1, before + vim.fn.strdisplaywidth(ch, before)))
   end
 
   function vim.fn.strpart(s, start, len, ...)
@@ -4886,6 +5288,7 @@ do
     'buffer', 'b', 'bnext', 'bn', 'bprev', 'bp', 'bdelete', 'bd', 'split',
     'sp', 'vsplit', 'vsp', 'tabnew', 'tabedit', 'tabnext', 'tabprevious',
     'close', 'packadd', 'lcd', 'cd', 'pwd', 'version', 'help', 'messages', 'lsp',
+    'nohlsearch', 'noh', 'redraw',
   }) do
     builtin_commands[name] = true
   end
