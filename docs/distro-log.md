@@ -42,3 +42,4 @@ See `docs/DISTRO-LOOP.md` §3 step 7.
 2026-10-23 DISTRO-119 nvim_set_hl auto cterm from gui attrs; probe snapshots highlight groups | distro_diff IDENTICAL (with highlights); verify 33/33 | commit (this)
 2026-10-23 DISTRO-120 expr/nowait keymaps, nvim_eval, <Plug> under noremap, event loop in TUI, typed registers + :normal | tui_smoke real config 27→29/29; verify 34/34; distro_diff IDENTICAL | commit (this)
 2026-10-23 DISTRO-121 AstroNvim first run: keytrans + sign_define so astrocore.setup completes | astro keymaps missing 184→5, commands 9→2, opts now match; LazyVim still IDENTICAL; verify 35/35 | commit (this)
+2026-10-23 DISTRO-122 environ, get_runtime_file("") slashes, decoration provider stub, --cmd | astro sections differing 9→6 (g, opts, rtp_count, highlights now match); LazyVim IDENTICAL; verify 36/36 | commit (this)

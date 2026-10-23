@@ -2053,7 +2053,8 @@ vim.api.nvim_get_runtime_file = function(name, all)
   local found = {}
   for _, dir in ipairs(list_get('runtimepath')) do
     for _, sub in ipairs(expand_braces(name)) do
-      local pattern = dir .. '/' .. sub
+      -- Like Neovim: "" yields the dir itself; no doubled '/' (lazy.nvim feeds these back into rtp).
+      local pattern = (sub == '' or dir:sub(-1) == '/') and dir .. sub or dir .. '/' .. sub
       local matches
       if pattern:find('[*?]') then
         matches = vim.fn.glob(pattern, false, true)
@@ -2390,6 +2391,16 @@ do
     end
     return table.concat(out)
   end
+end
+
+-- shortcut: providers are stored but never invoked; the TUI has no decoration redraw pass yet.
+vim._decoration_providers = {}
+function vim.api.nvim_set_decoration_provider(ns_id, opts)
+  vim._decoration_providers[ns_id] = opts
+end
+
+function vim.fn.environ()
+  return vim.uv.os_environ()
 end
 
 -- Sign definitions. shortcut: definitions only; sign_place and drawing signs in the TUI are not done.

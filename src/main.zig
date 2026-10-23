@@ -212,6 +212,8 @@ pub fn main(init: std.process.Init) !void {
     var lua_script: ?[]const u8 = null;
     var cmds = std.ArrayList([]const u8).initCapacity(gpa, 0) catch unreachable;
     defer cmds.deinit(gpa);
+    var pre_cmds = std.ArrayList([]const u8).initCapacity(gpa, 0) catch unreachable;
+    defer pre_cmds.deinit(gpa);
     var file_arg: ?[]const u8 = null;
     var clean = false;
     var headless = false;
@@ -244,6 +246,13 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             try cmds.append(gpa, args.items[i]);
+        } else if (std.mem.eql(u8, arg, "--cmd")) {
+            i += 1;
+            if (i >= args.items.len) {
+                std.debug.print("Error: --cmd requires command\n", .{});
+                std.process.exit(1);
+            }
+            try pre_cmds.append(gpa, args.items[i]);
         } else if (std.mem.eql(u8, arg, "--clean")) {
             clean = true;
         } else if (std.mem.eql(u8, arg, "--headless") or std.mem.eql(u8, arg, "-es")) {
@@ -285,6 +294,9 @@ pub fn main(init: std.process.Init) !void {
     try loadPrelude(L);
     try loadTui(L);
 
+    // --cmd runs before any config is loaded (Neovim CLI semantics).
+    for (pre_cmds.items) |cmd| _ = execVimCommand(L, cmd);
+
     if (embed_mode) {
         try runRpcServer(init.io, L);
         return;
@@ -305,7 +317,7 @@ pub fn main(init: std.process.Init) !void {
             }
             std.process.exit(1);
         }
-    } else if (file_arg != null or cmds.items.len > 0) {
+    } else if (file_arg != null or cmds.items.len > 0 or pre_cmds.items.len > 0) {
         // Editor mode: load configuration, open the requested file, then run
         // the -c commands in order (Neovim CLI semantics).
         _ = startupEditor(L, init_file, clean);
@@ -540,6 +552,8 @@ fn registerVimGlobal(L: *c.lua_State) !void {
     c.lua_setfield(L, -2, "os_getenv");
     c.lua_pushcfunction(L, luaUvOsSetenv);
     c.lua_setfield(L, -2, "os_setenv");
+    c.lua_pushcfunction(L, luaUvOsEnviron);
+    c.lua_setfield(L, -2, "os_environ");
     c.lua_pushcfunction(L, luaUvOsUnsetenv);
     c.lua_setfield(L, -2, "os_unsetenv");
     c.lua_pushcfunction(L, luaUvHrtime);
@@ -1505,6 +1519,22 @@ fn luaUvOsGetenv(L: ?*c.lua_State) callconv(.c) c_int {
     }
     const len = std.mem.indexOfScalar(u8, &buf, 0) orelse size;
     c.lua_pushlstring(LS, &buf, len);
+    return 1;
+}
+
+fn luaUvOsEnviron(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    var items: [*c]c.uv_env_item_t = undefined;
+    var count: c_int = 0;
+    c.lua_newtable(LS);
+    if (c.uv_os_environ(&items, &count) != 0) return 1;
+    defer c.uv_os_free_environ(items, count);
+    var k: usize = 0;
+    while (k < @as(usize, @intCast(count))) : (k += 1) {
+        c.lua_pushstring(LS, items[k].name);
+        c.lua_pushstring(LS, items[k].value);
+        c.lua_settable(LS, -3);
+    }
     return 1;
 }
 
