@@ -273,11 +273,36 @@ end
 local function err(msg)
   S.msg = msg
   S.msg_err = true
+  vim._msg_save(msg)
 end
 
 local function info(msg)
   S.msg = msg
   S.msg_err = false
+  vim._msg_save(msg)
+end
+
+-- Undo summary in Neovim's words: "1 line less; before #3  0 seconds ago".
+local function undo_message(old_lines, new_lines, seq, word, time)
+  local delta = #new_lines - #old_lines
+  local what
+  if delta > 0 then
+    what = delta == 1 and '1 more line' or (delta .. ' more lines')
+  elseif delta < 0 then
+    what = delta == -1 and '1 line less' or (-delta .. ' fewer lines')
+  else
+    local n = 0
+    for i = 1, #new_lines do
+      if new_lines[i] ~= old_lines[i] then
+        n = n + 1
+      end
+    end
+    n = math.max(n, 1)
+    what = n == 1 and '1 change' or (n .. ' changes')
+  end
+  local age = math.floor((vim.uv.hrtime() - (time or vim.uv.hrtime())) / 1e9)
+  local when = age < 100 and (age == 1 and '1 second ago' or (age .. ' seconds ago')) or os.date('%H:%M:%S', os.time() - age)
+  return string.format('%s; %s #%d  %s', what, word, seq or 0, when)
 end
 
 local function snapshot()
@@ -1806,21 +1831,25 @@ end
 local function do_undo()
   local snap = table.remove(S.undo)
   if not snap then
-    info('Already at oldest change')
+    err('Already at oldest change')
     return
   end
-  S.redo[#S.redo + 1] = { lines = api.nvim_buf_get_lines(0, 0, -1, false), row = S.row, col = S.col }
+  local cur = api.nvim_buf_get_lines(0, 0, -1, false)
+  S.redo[#S.redo + 1] = { lines = cur, row = S.row, col = S.col, seq = snap.seq, time = snap.time }
   undo_restore(snap)
+  info(undo_message(cur, snap.lines, snap.seq, 'before', snap.time))
 end
 
 local function do_redo()
   local snap = table.remove(S.redo)
   if not snap then
-    info('Already at newest change')
+    err('Already at newest change')
     return
   end
-  S.undo[#S.undo + 1] = { lines = api.nvim_buf_get_lines(0, 0, -1, false), row = S.row, col = S.col }
+  local cur = api.nvim_buf_get_lines(0, 0, -1, false)
+  S.undo[#S.undo + 1] = { lines = cur, row = S.row, col = S.col, seq = snap.seq, time = snap.time }
   undo_restore(snap)
+  info(undo_message(cur, snap.lines, snap.seq, 'after', snap.time))
 end
 
 -- -------------------------------------------------------------- insert mode
@@ -2642,6 +2671,8 @@ local function main_loop()
       S.last_change = S.cur_keys
     end
     if S.cur_snap then
+      S.seq = (S.seq or 0) + 1
+      S.cur_snap.seq, S.cur_snap.time = S.seq, vim.uv.hrtime()
       S.undo[#S.undo + 1] = S.cur_snap
       if #S.undo > 200 then
         table.remove(S.undo, 1)
@@ -2664,9 +2695,14 @@ function M.run()
     return
   end
   write('\27[?1049h\27[2J')
+  vim._tui_msg = function(text, is_err)
+    local first = tostring(text):match('^[^\n]*')
+    S.msg, S.msg_err = first, is_err and true or false
+  end
   local ok, e = xpcall(main_loop, debug.traceback)
   write('\27[0 q\27[?25h\27[?1049l')
   vim._tty_raw(false)
+  vim._tui_msg = nil
   if not ok then
     io.stderr:write('zigvim: ' .. tostring(e) .. '\n')
   end

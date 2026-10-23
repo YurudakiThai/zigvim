@@ -358,16 +358,27 @@ function vim.deprecate(name, alternative, version, plugin, backtrace)
   return true
 end
 
+-- Message history for :messages (Neovim keeps nvim_echo(history=true), notify,
+-- errors and editor messages such as the undo summary). shortcut: 200 entries.
+vim._msg_history = {}
+function vim._msg_save(text)
+  local h = vim._msg_history
+  h[#h + 1] = text
+  if #h > 200 then
+    table.remove(h, 1)
+  end
+end
+
+-- Neovim's default vim.notify: an nvim_echo with history, error-highlighted for ERROR.
 function vim.notify(msg, level, opts)
   level = level or vim.log.levels.INFO
-  local prefix = ({
-    [vim.log.levels.TRACE] = 'TRACE',
-    [vim.log.levels.DEBUG] = 'DEBUG',
-    [vim.log.levels.INFO] = 'INFO',
-    [vim.log.levels.WARN] = 'WARN',
-    [vim.log.levels.ERROR] = 'ERROR',
-  })[level]
-  io.stderr:write((prefix and (prefix .. ': ') or '') .. tostring(msg) .. '\n')
+  if level == vim.log.levels.ERROR then
+    vim.api.nvim_echo({ { tostring(msg) } }, true, { err = true })
+  elseif level == vim.log.levels.WARN then
+    vim.api.nvim_echo({ { tostring(msg), 'WarningMsg' } }, true, {})
+  else
+    vim.api.nvim_echo({ { tostring(msg) } }, true, {})
+  end
   return nil
 end
 
@@ -1692,7 +1703,9 @@ local function exec_cmd(cmd)
   elseif name == 'exe' or name == 'execute' or name == 'exec' then
     exec_cmd(tostring(vim.api.nvim_eval(rest)))
   elseif name == 'messages' or name == 'mes' then
-    -- shortcut: no message history is kept yet, so :messages shows nothing
+    if #vim._msg_history > 0 then
+      vim._out(table.concat(vim._msg_history, '\n') .. '\n')
+    end
   elseif name == 'normal' or name == 'normal!' or name == 'norm' or name == 'norm!' then
     -- shortcut: only runs while the TUI is active; headless :normal is a no-op.
     if vim._tui_normal then
@@ -2040,6 +2053,8 @@ function vim._out(text)
   local top = out_stack[#out_stack]
   if top then
     top[#top + 1] = text
+  elseif vim._tui_msg then
+    vim._tui_msg((text:gsub('\n$', '')), false)
   else
     io.stdout:write(text)
   end
@@ -2326,13 +2341,20 @@ vim.api.nvim_get_runtime_file = function(name, all)
   return found
 end
 
-vim.api.nvim_echo = function(chunks, _history, opts)
+vim.api.nvim_echo = function(chunks, history, opts)
   local parts = {}
   for _, chunk in ipairs(chunks or {}) do
     parts[#parts + 1] = tostring(chunk[1])
   end
-  local stream = (opts and opts.err) and io.stderr or io.stdout
-  stream:write(table.concat(parts) .. '\n')
+  local text = table.concat(parts)
+  if history then
+    vim._msg_save(text)
+  end
+  if vim._tui_msg then
+    vim._tui_msg(text, opts and opts.err) -- the TUI's message line, not raw stdout
+  else
+    io.stderr:write(text .. '\n') -- Neovim headless writes messages to stderr
+  end
 end
 
 function vim.fn.getchar()
@@ -5172,6 +5194,11 @@ do
 
   vim.api.nvim_buf_clear_namespace = function(buf, ns, line_start, line_end)
     vim._ui_gen = vim._ui_gen + 1
+    buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
+    line_start = line_start or 0
+    if line_end == nil or line_end < 0 then -- -1: to the end of the buffer
+      line_end = math.huge
+    end
     local buffer_marks = extmarks[buf] or {}
     if ns == -1 then
       for _, marks in pairs(buffer_marks) do
@@ -6267,6 +6294,10 @@ do
   end
 
   function vim.fn.getqflist(opts)
+    if type(opts) == 'table' and opts.lines ~= nil then
+      -- parse lines with 'errorformat' without touching the quickfix list
+      return { items = require('vim._efm').parse(opts.efm or vim.o.errorformat or '', opts.lines) }
+    end
     if type(opts) == 'table' and opts.title ~= nil then
       return { title = quickfix_title }
     end

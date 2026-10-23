@@ -607,6 +607,7 @@ const embedded_lua_modules = [_]struct { name: [:0]const u8, source: [:0]const u
     .{ .name = "vim._diff", .source = @embedFile("lua/vim/_diff.lua") },
     .{ .name = "vim._regex", .source = @embedFile("lua/vim/_regex.lua") },
     .{ .name = "vim._options_info", .source = @embedFile("lua/vim/_options_info.lua") },
+    .{ .name = "vim._efm", .source = @embedFile("lua/vim/_efm.lua") },
 };
 
 /// Expose the embedded modules as a global table that prelude.lua turns into a

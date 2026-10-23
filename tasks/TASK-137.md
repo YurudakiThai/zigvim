@@ -44,3 +44,17 @@ Language servers now attach, which exposes the LSP surface: incremental sync
   the whole source.
 
 Sweep (7 filetypes, real LazyVim config): zigvim-only errors 5 → 0.
+
+## Round 3 (after critic 2: distinguishable on 8/8 files)
+
+- TASK-145 `getqflist({efm, lines})`: 'errorformat' parser (src/lua/vim/_efm.lua),
+  identical to Neovim on every errorformat used by nvim-lint's linters
+  (from_errorformat was broken, which also changed what markdown format-on-save
+  wrote). `nvim_buf_clear_namespace` honours `-1` / buffer 0 (stale diagnostic
+  signs on fixed files).
+- TASK-146 `vim.diff` `linematch`, ported from Neovim's linematch.c (gitsigns
+  hunk shapes after edits).
+- Undo/redo summaries ("1 line less; before #2  0 seconds ago", "Already at
+  oldest change"), a message history for `:messages`, Neovim's default
+  `vim.notify` (nvim_echo with history, no "ERROR:" prefix), and messages shown on
+  the TUI's message line instead of written over the screen.

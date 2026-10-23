@@ -169,6 +169,111 @@ local function compute_hunks(a, b)
   return hunks
 end
 
+-- linematch: re-align the lines inside a change hunk by similarity, ported from
+-- Neovim's linematch.c for two buffers. Cells are filled row by row; each cell keeps
+-- every predecessor move with the best score (pair = LCS of the two lines, a skip
+-- scores 0; tried in the order pair, delete, insert). The path is then traced back
+-- choosing, among those, the one with the fewest changes of move type (first wins),
+-- including linematch.c's per-node choice that the last computation overwrites.
+local function lcs_len(x, y)
+  local prev = {}
+  for j = 0, #y do
+    prev[j] = 0
+  end
+  for i = 1, #x do
+    local cur = { [0] = 0 }
+    local xi = x:byte(i)
+    for j = 1, #y do
+      if xi == y:byte(j) then
+        cur[j] = prev[j - 1] + 1
+      else
+        cur[j] = math.max(prev[j], cur[j - 1])
+      end
+    end
+    prev = cur
+  end
+  return prev[#y]
+end
+
+local PAIR, DEL, INS = 3, 1, 2
+
+local function linematch_hunk(a, b, h)
+  local sa, ca, sb, cb = h[1], h[2], h[3], h[4]
+  local cell = {}
+  local function node(i, j)
+    return cell[i * (cb + 1) + j]
+  end
+  for i = 0, ca do
+    for j = 0, cb do
+      local n = { score = 0, preds = {}, choices = {}, mem = {} }
+      cell[i * (cb + 1) + j] = n
+      if i > 0 or j > 0 then
+        n.score = -1
+        local cands = {}
+        if i > 0 and j > 0 then
+          cands[#cands + 1] = { PAIR, i - 1, j - 1, lcs_len(a[sa + i - 1]:sub(1, 799), b[sb + j - 1]:sub(1, 799)) }
+        end
+        if i > 0 then
+          cands[#cands + 1] = { DEL, i - 1, j, 0 }
+        end
+        if j > 0 then
+          cands[#cands + 1] = { INS, i, j - 1, 0 }
+        end
+        for _, c in ipairs(cands) do
+          local sc = node(c[2], c[3]).score + c[4]
+          if sc > n.score then
+            n.score, n.preds, n.choices = sc, { node(c[2], c[3]) }, { c[1] }
+          elseif sc == n.score then
+            n.preds[#n.preds + 1], n.choices[#n.choices + 1] = node(c[2], c[3]), c[1]
+          end
+        end
+      end
+    end
+  end
+  local function turns(n, last)
+    if #n.preds == 0 then
+      return 0
+    end
+    if n.mem[last] then
+      return n.mem[last]
+    end
+    local best = math.huge
+    for k = 1, #n.preds do
+      local t = turns(n.preds[k], n.choices[k]) + (last ~= n.choices[k] and 1 or 0)
+      if t < best then
+        best, n.optimal = t, k
+      end
+    end
+    n.mem[last] = best
+    return best
+  end
+  local endn = node(ca, cb)
+  turns(endn, 0)
+  local steps, n = {}, endn
+  while #n.preds > 0 do
+    table.insert(steps, 1, n.choices[n.optimal])
+    n = n.preds[n.optimal]
+  end
+  local out, ia, ib, k = {}, sa, sb, 1
+  while k <= #steps do
+    local kind, cnt = steps[k], 0
+    while steps[k] == kind do
+      cnt, k = cnt + 1, k + 1
+    end
+    if kind == PAIR then
+      out[#out + 1] = { ia, cnt, ib, cnt }
+      ia, ib = ia + cnt, ib + cnt
+    elseif kind == DEL then
+      out[#out + 1] = { ia, cnt, ib - 1, 0 }
+      ia = ia + cnt
+    else
+      out[#out + 1] = { ia - 1, 0, ib, cnt }
+      ib = ib + cnt
+    end
+  end
+  return out
+end
+
 local function range(start, count)
   if count == 1 then
     return tostring(start)
@@ -257,6 +362,20 @@ function M.diff(a, b, opts)
     kb[i] = norm(l)
   end
   local hunks = compute_hunks(ka, kb)
+  local lm = tonumber(opts.linematch)
+  if lm and lm > 0 then
+    local split = {}
+    for _, h in ipairs(hunks) do
+      if h[2] > 0 and h[4] > 0 and h[2] + h[4] <= lm then
+        for _, sub in ipairs(linematch_hunk(ka, kb, h)) do
+          split[#split + 1] = sub
+        end
+      else
+        split[#split + 1] = h
+      end
+    end
+    hunks = split
+  end
   if opts.ignore_blank_lines then
     hunks = vim.tbl_filter(function(h)
       for l = h[1], h[1] + h[2] - 1 do
