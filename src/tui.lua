@@ -2543,8 +2543,6 @@ function M.run()
     return
   end
   write('\27[?1049h\27[2J')
-  vim.v.vim_did_enter = 1
-  pcall(vim._exec_autocmds, 'VimEnter', {})
   local ok, e = xpcall(main_loop, debug.traceback)
   write('\27[0 q\27[?25h\27[?1049l')
   vim._tty_raw(false)

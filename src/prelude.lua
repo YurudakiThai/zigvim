@@ -1712,6 +1712,8 @@ local function exec_cmd(cmd)
     or name == 'onoremenu' or name == 'tnoremenu'
     or name == 'unmenu' or name == 'aunmenu' then
     -- Accepted and ignored: no Vimscript engine / highlighter / menu system behind these yet.
+  elseif name == 'lsp' then
+    require('vim._core.ex_cmd').ex_lsp(rest)
   elseif name == 'highlight' or name == 'hi' or name == 'highlight!' or name == 'hi!' then
     vim._hl_command(name:sub(-1) == '!', rest)
   elseif name == 'colorscheme' or name == 'colo' then
@@ -4833,9 +4835,32 @@ do
     'nnoremap', 'vnoremap', 'inoremap', 'command', 'delcommand', 'normal',
     'buffer', 'b', 'bnext', 'bn', 'bprev', 'bp', 'bdelete', 'bd', 'split',
     'sp', 'vsplit', 'vsp', 'tabnew', 'tabedit', 'tabnext', 'tabprevious',
-    'close', 'packadd', 'lcd', 'cd', 'pwd', 'version', 'help', 'messages',
+    'close', 'packadd', 'lcd', 'cd', 'pwd', 'version', 'help', 'messages', 'lsp',
   }) do
     builtin_commands[name] = true
+  end
+
+  -- shortcut: name, bang and whitespace-split args only; no ranges, counts, registers,
+  -- command modifiers or per-command nargs/addr. Add them when a plugin needs them.
+  function vim.api.nvim_parse_cmd(str, _opts)
+    local name, bang, rest = tostring(str):match('^[%s:]*(%a[%w_]*)(!?)%s*(.-)%s*$')
+    if not name or not (builtin_commands[name] or (vim._user_commands and vim._user_commands[name])) then
+      error('Parsing command-line: E492: Not an editor command: ' .. tostring(str), 0)
+    end
+    local args = {}
+    for word in rest:gmatch('%S+') do
+      args[#args + 1] = word
+    end
+    return {
+      cmd = name, bang = bang == '!', args = args, addr = 'none', nargs = '*', nextcmd = '',
+      magic = { bar = false, file = false },
+      mods = {
+        browse = false, confirm = false, emsg_silent = false, filter = { force = false, pattern = '' },
+        hide = false, horizontal = false, keepalt = false, keepjumps = false, keepmarks = false,
+        keeppatterns = false, lockmarks = false, noautocmd = false, noswapfile = false, sandbox = false,
+        silent = false, split = '', tab = -1, unsilent = false, verbose = -1, vertical = false,
+      },
+    }
   end
 
   local function vvar_exists(name)

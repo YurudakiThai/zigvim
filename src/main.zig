@@ -336,62 +336,46 @@ pub fn main(init: std.process.Init) !void {
     }
 
 
-    // Set vim.v.vim_did_enter = 1 before firing VimEnter
-    c.lua_getglobal(L, "vim");
-    c.lua_getfield(L, -1, "v");
-    c.lua_pushinteger(L, 1);
-    c.lua_setfield(L, -2, "vim_did_enter");
-    c.lua_pop(L, 1); // pop vim.v
-    c.lua_pop(L, 1); // pop vim
-
-    // Fire VimEnter and UIEnter events (needed by lazy.nvim and other plugins)
-
-    c.lua_getglobal(L, "vim");
-    c.lua_getfield(L, -1, "_exec_autocmds");
-    c.lua_pushstring(L, "VimEnter");
-    c.lua_newtable(L);
-    if (c.lua_pcall(L, 2, 0, 0) != 0) {
-        c.lua_pop(L, 1); // pop error message
-    }
-
-    // Fire BufEnter for the initial buffer (buffer 1) BEFORE UIEnter
-    // This is needed for plugins like snacks.explorer that load on BufEnter
-    // snacks.setup() creates a once=true autocmd for multiple events;
-    // the first event to fire removes the autocmd, so order matters.
-    c.lua_getfield(L, -1, "_exec_autocmds");
-    c.lua_pushstring(L, "BufEnter");
-    c.lua_newtable(L);
-    if (c.lua_pcall(L, 2, 0, 0) != 0) {
-        c.lua_pop(L, 1); // pop error message
-    }
-
-    c.lua_getfield(L, -1, "_exec_autocmds");
-    c.lua_pushstring(L, "UIEnter");
-    c.lua_newtable(L);
-    if (c.lua_pcall(L, 2, 0, 0) != 0) {
-        c.lua_pop(L, 1); // pop error message
-    }
-
-    c.lua_pop(L, 1); // pop vim table
-
-
-    var quit_requested = false;
-    for (cmds.items) |cmd| {
-        _ = execVimCommand(L, cmd);
-        const t = std.mem.trim(u8, cmd, " \t:");
-        if (std.mem.eql(u8, t, "q") or std.mem.eql(u8, t, "q!") or std.mem.eql(u8, t, "qa") or
-            std.mem.eql(u8, t, "qa!") or std.mem.eql(u8, t, "qall") or std.mem.eql(u8, t, "wq") or
-            std.mem.eql(u8, t, "x") or std.mem.eql(u8, t, "wqa")) quit_requested = true;
-    }
-
-    if (lua_script == null and !headless and !quit_requested and isInteractive()) {
-        runTui(L);
+    // Neovim's order: BufEnter for the first buffer, the -c commands, then VimEnter
+    // (unless a -c command quit), and UIEnter only once a UI is attached. `-l` gets none.
+    if (lua_script == null) {
+        fireAutocmd(L, "BufEnter");
+        var quit_requested = false;
+        for (cmds.items) |cmd| {
+            _ = execVimCommand(L, cmd);
+            const t = std.mem.trim(u8, cmd, " \t:");
+            if (std.mem.eql(u8, t, "q") or std.mem.eql(u8, t, "q!") or std.mem.eql(u8, t, "qa") or
+                std.mem.eql(u8, t, "qa!") or std.mem.eql(u8, t, "qall") or std.mem.eql(u8, t, "wq") or
+                std.mem.eql(u8, t, "x") or std.mem.eql(u8, t, "wqa")) quit_requested = true;
+            if (quit_requested) break;
+        }
+        if (!quit_requested) {
+            c.lua_getglobal(L, "vim");
+            c.lua_getfield(L, -1, "v");
+            c.lua_pushinteger(L, 1);
+            c.lua_setfield(L, -2, "vim_did_enter");
+            c.lua_pop(L, 2);
+            fireAutocmd(L, "VimEnter");
+            if (!headless and isInteractive()) {
+                fireAutocmd(L, "UIEnter");
+                runTui(L);
+            }
+        }
     }
 
     pumpEventLoop(L);
     // Give libuv a chance to finish one-shot deferred callbacks.
     const loop = getLoop();
     _ = c.uv_run(loop, c.UV_RUN_NOWAIT);
+}
+
+fn fireAutocmd(L: *c.lua_State, event: [*:0]const u8) void {
+    c.lua_getglobal(L, "vim");
+    c.lua_getfield(L, -1, "_exec_autocmds");
+    c.lua_pushstring(L, event);
+    c.lua_newtable(L);
+    if (c.lua_pcall(L, 2, 0, 0) != 0) c.lua_pop(L, 1);
+    c.lua_pop(L, 1);
 }
 
 fn isInteractive() bool {
