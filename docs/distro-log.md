@@ -43,3 +43,4 @@ See `docs/DISTRO-LOOP.md` §3 step 7.
 2026-10-23 DISTRO-120 expr/nowait keymaps, nvim_eval, <Plug> under noremap, event loop in TUI, typed registers + :normal | tui_smoke real config 27→29/29; verify 34/34; distro_diff IDENTICAL | commit (this)
 2026-10-23 DISTRO-121 AstroNvim first run: keytrans + sign_define so astrocore.setup completes | astro keymaps missing 184→5, commands 9→2, opts now match; LazyVim still IDENTICAL; verify 35/35 | commit (this)
 2026-10-23 DISTRO-122 environ, get_runtime_file("") slashes, decoration provider stub, --cmd | astro sections differing 9→6 (g, opts, rtp_count, highlights now match); LazyVim IDENTICAL; verify 36/36 | commit (this)
+2026-10-23 DISTRO-123 vendored LPeg 1.1.0 (vim.lpeg) + vim.version runtime module at 0.12.6 | astro: all core setups succeed, plugins section matches, modules missing 56→6; LazyVim IDENTICAL; verify 38/38 | commit (this)

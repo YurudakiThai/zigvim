@@ -291,6 +291,7 @@ pub fn main(init: std.process.Init) !void {
     g_L = L;
     registerEmbeddedModules(L);
     try registerVimGlobal(L);
+    registerLpeg(L);
     try loadPrelude(L);
     try loadTui(L);
 
@@ -612,6 +613,21 @@ fn registerEmbeddedModules(L: *c.lua_State) void {
         c.lua_setfield(L, -2, module.name.ptr);
     }
     c.lua_setglobal(L, "_ZIGVIM_EMBEDDED");
+}
+
+// Like Neovim: lpeg is preloaded into package.loaded.lpeg and exposed as vim.lpeg.
+fn registerLpeg(L: *c.lua_State) void {
+    c.lua_pushcfunction(L, @as(c.lua_CFunction, @ptrCast(&c.luaopen_lpeg)));
+    c.lua_call(L, 0, 1);
+    c.lua_getglobal(L, "package");
+    c.lua_getfield(L, -1, "loaded");
+    c.lua_pushvalue(L, -3);
+    c.lua_setfield(L, -2, "lpeg");
+    c.lua_pop(L, 2);
+    c.lua_getglobal(L, "vim");
+    c.lua_pushvalue(L, -2);
+    c.lua_setfield(L, -2, "lpeg");
+    c.lua_pop(L, 2);
 }
 
 fn loadPrelude(L: *c.lua_State) !void {

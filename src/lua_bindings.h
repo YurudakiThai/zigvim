@@ -9,5 +9,8 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 
+// Vendored LPeg (deps/lpeg)
+int luaopen_lpeg(lua_State *L);
+
 // lua_pushcfunction is a macro in Lua, define it here for Zig
 #define lua_pushcfunction(L, f) lua_pushcclosure(L, f, 0)

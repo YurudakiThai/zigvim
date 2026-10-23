@@ -55,6 +55,20 @@ pub fn build(b: *std.Build) void {
     // TASK-INFRA-001: Link libuv (cross-platform)
     exe.root_module.linkSystemLibrary("uv", .{});
 
+    // LPeg (vendored, deps/lpeg): Neovim bundles it as vim.lpeg; built against the LuaJIT headers.
+    exe.root_module.addCSourceFiles(.{
+        .root = b.path("deps/lpeg"),
+        .files = &.{ "lpcap.c", "lpcode.c", "lpcset.c", "lpprint.c", "lptree.c", "lpvm.c" },
+        .flags = &.{ "-std=c99", "-DNDEBUG" },
+    });
+    if (os_tag == .macos) {
+        exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/luajit-2.1" });
+        exe.root_module.addIncludePath(.{ .cwd_relative = "/usr/local/include/luajit-2.1" });
+    } else if (os_tag == .linux) {
+        exe.root_module.addIncludePath(.{ .cwd_relative = "/usr/include/luajit-2.1" });
+        exe.root_module.addIncludePath(.{ .cwd_relative = "/usr/local/include/luajit-2.1" });
+    }
+
     // Link libc (required for C interop)
     exe.root_module.link_libc = true;
 

@@ -303,8 +303,15 @@ end
 vim.json = json
 
 -- ------------------------------------------------------------- vim.version
-vim.version = function()
-  return { major = 0, minor = 1, patch = 0 }
+-- vim.version is the runtime module (lazy-loaded); it reads the version from
+-- api_info(), which reports the Neovim release zigvim is tested against.
+function vim.fn.api_info()
+  return {
+    version = {
+      major = 0, minor = 12, patch = 6, api_level = 14, api_compatible = 0,
+      api_prerelease = false, prerelease = false, build = vim.NIL,
+    },
+  }
 end
 
 -- ---------------------------------------------------------- vim.log/notify
