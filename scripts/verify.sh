@@ -15,17 +15,17 @@ if [[ "$TASK" == "all" ]]; then
   for f in "$ROOT/cases"/TASK-*.lua; do
     name=$(basename "$f" .lua)
     if python3 "$DIR/oracle.py" --test "$f" --zigvim "$ZIGVIM" "$@" 2>/dev/null; then
-      ((pass++)); echo "  PASS $name"
+      pass=$((pass + 1)); echo "  PASS $name"
     else
-      ((fail++)); echo "  FAIL $name"
+      fail=$((fail + 1)); echo "  FAIL $name"
     fi
   done
   # TASK-INFRA-005 drives the RPC server over stdin/stdout, so it uses the
   # dedicated integration harness instead of a Lua oracle case.
   if python3 "$DIR/rpc_verify.py" --zigvim "$ZIGVIM" >/dev/null 2>&1; then
-    ((pass++)); echo "  PASS TASK-INFRA-005"
+    pass=$((pass + 1)); echo "  PASS TASK-INFRA-005"
   else
-    ((fail++)); echo "  FAIL TASK-INFRA-005"
+    fail=$((fail + 1)); echo "  FAIL TASK-INFRA-005"
   fi
   echo ""; echo "=== $pass pass / $fail fail ==="
   [[ "$fail" -eq 0 ]]

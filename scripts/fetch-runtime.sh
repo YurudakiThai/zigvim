@@ -55,7 +55,7 @@ else
 fi
 
 echo "Extracting runtime/lua..."
-tar -xzf "$TMP_FILE" -C "$RUNTIME_DIR" --strip-components=2 "nvim-${PLATFORM}-${ARCH}/share/nvim/runtime/lua"
+tar -xzf "$TMP_FILE" -C "$RUNTIME_DIR" --strip-components=4 "nvim-${PLATFORM}-${ARCH}/share/nvim/runtime/lua"
 
 rm "$TMP_FILE"
 

@@ -35,7 +35,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libluajit-5.1-dev libuv1-dev neovim
+          sudo apt-get install -y libluajit-5.1-dev libuv1-dev
+          # The oracle must be Neovim 0.12.6; apt's neovim is much older.
+          curl -sSfL -o /tmp/nvim.tar.gz https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-linux-x86_64.tar.gz
+          sudo tar -xzf /tmp/nvim.tar.gz -C /opt
+          echo /opt/nvim-linux-x86_64/bin >> "$GITHUB_PATH"
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'

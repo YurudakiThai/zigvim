@@ -15,13 +15,14 @@ Exit codes:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 from pathlib import Path
 
-NVIM = "/opt/homebrew/bin/nvim"
+NVIM = shutil.which("nvim") or "/opt/homebrew/bin/nvim"
 TIMEOUT = 10  # seconds
 
 
