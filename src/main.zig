@@ -602,6 +602,7 @@ const embedded_lua_modules = [_]struct { name: [:0]const u8, source: [:0]const u
     .{ .name = "vim._archives", .source = @embedFile("lua/vim/_archives.lua") },
     .{ .name = "vim._tutor", .source = @embedFile("lua/vim/_tutor.lua") },
     .{ .name = "vim._remote", .source = @embedFile("lua/vim/_remote.lua") },
+    .{ .name = "vim._default_hl", .source = @embedFile("lua/vim/_default_hl.lua") },
 };
 
 /// Expose the embedded modules as a global table that prelude.lua turns into a

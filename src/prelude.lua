@@ -1704,8 +1704,7 @@ local function exec_cmd(cmd)
     or name == 'cmapclear' or name == 'tmapclear' then
     -- Unmap commands: accepted but not fully implemented (would need to iterate and delete)
   elseif name == 'augroup' or name == 'aug' or name == 'packadd' or name == 'filetype'
-    or name == 'syntax' or name == 'syn' or name == 'highlight' or name == 'hi'
-    or name == 'highlight!' or name == 'hi!'
+    or name == 'syntax' or name == 'syn'
     or name == 'menu' or name == 'amenu' or name == 'nmenu' or name == 'vmenu'
     or name == 'imenu' or name == 'cmenu' or name == 'omenu' or name == 'tmenu'
     or name == 'noremenu' or name == 'anoremenu' or name == 'nnoremenu'
@@ -1713,6 +1712,8 @@ local function exec_cmd(cmd)
     or name == 'onoremenu' or name == 'tnoremenu'
     or name == 'unmenu' or name == 'aunmenu' then
     -- Accepted and ignored: no Vimscript engine / highlighter / menu system behind these yet.
+  elseif name == 'highlight' or name == 'hi' or name == 'highlight!' or name == 'hi!' then
+    vim._hl_command(name:sub(-1) == '!', rest)
   elseif name == 'colorscheme' or name == 'colo' then
     local scheme = rest
     if scheme == '' then
@@ -3827,7 +3828,12 @@ do
 
   vim.api.nvim_set_hl = function(ns, name, val)
     val = val or {}
-    local group = highlight_groups[name] or {}
+    local existing = highlight_groups[name]
+    -- default=true never overrides a defined group; update=true merges, otherwise replace.
+    if val.default and existing and next(existing) ~= nil then
+      return 0
+    end
+    local group = (val.update and existing) and vim.deepcopy(existing) or {}
     if val.link and val.link ~= '' then
       group.link = val.link
       group.fg = nil
@@ -3851,6 +3857,11 @@ do
       for _, key in ipairs(attr_keys) do
         if val[key] ~= nil then
           group[key] = val[key] and true or nil
+        end
+      end
+      for _, key in ipairs({ 'ctermfg', 'ctermbg', 'blend' }) do
+        if val[key] ~= nil then
+          group[key] = val[key]
         end
       end
       if val.cterm ~= nil then
@@ -3905,26 +3916,81 @@ do
       end
       return copy
     end
+    -- link = false resolves the link chain to the attributes it ends at (Neovim).
+    local function resolve(group)
+      local seen = 0
+      while group.link and seen < 100 do
+        local target = highlight_groups[group.link]
+        if not target then
+          return {}
+        end
+        group, seen = target, seen + 1
+      end
+      return group
+    end
+    local function get(group)
+      return copy_group(opts.link == false and resolve(group) or group)
+    end
     if opts.name ~= nil then
       local group = highlight_groups[opts.name]
       if not group then
         return {}
       end
-      local copy = copy_group(group)
-      if opts.link == false then
-        copy.link = nil
-      end
-      return copy
+      return get(group)
     end
     local out = {}
     for name, group in pairs(highlight_groups) do
-      local copy = copy_group(group)
-      if opts.link == false then
-        copy.link = nil
-      end
-      out[name] = copy
+      out[name] = get(group)
     end
     return out
+  end
+
+  -- Neovim's built-in groups (generated from the oracle, see scripts/gen_default_hl.lua).
+  -- shortcut: applied at startup and on :hi clear; changing 'background' later does not reload them.
+  function vim._hl_reset()
+    local defaults = require('vim._default_hl')[vim.o.background == 'light' and 'light' or 'dark']
+    -- Like Neovim: user groups still exist after a clear; former links stay listed, empty.
+    for name, group in pairs(highlight_groups) do
+      vim.api.nvim_get_hl_id_by_name(name)
+      highlight_groups[name] = (group.link and not defaults[name]) and {} or nil
+    end
+    for name, group in pairs(defaults) do
+      highlight_groups[name] = vim.deepcopy(group)
+    end
+  end
+
+  function vim.fn.hlexists(name)
+    name = tostring(name)
+    if highlight_groups[name] or hl_ids[name] then
+      return 1
+    end
+    local lower = name:lower()
+    for n in pairs(highlight_groups) do
+      if n:lower() == lower then
+        return 1
+      end
+    end
+    return 0
+  end
+
+  -- :highlight clear [{group}] and :highlight [default] link {from} {to}.
+  -- shortcut: attribute arguments (guifg=, gui=bold, ...) are ignored.
+  function vim._hl_command(bang, rest)
+    local group = rest:match('^clear%s+(%S+)$')
+    if rest == 'clear' then
+      vim._hl_reset()
+    elseif group then
+      highlight_groups[group] = nil
+    else
+      local default, from, to = rest:match('^(d?e?f?a?u?l?t?)%s*link%s+(%S+)%s+(%S+)$')
+      if from then
+        if to == 'NONE' then
+          highlight_groups[from] = nil
+        elseif not (default ~= '' and highlight_groups[from] and not bang) then
+          vim.api.nvim_set_hl(0, from, { link = to, default = default ~= '' or nil })
+        end
+      end
+    end
   end
 
   vim.api.nvim_set_hl_ns = function(ns) end
@@ -5335,3 +5401,6 @@ if ok_remote then
 else
   io.stderr:write('Warning: failed to load vim._remote: ' .. tostring(remote) .. '\n')
 end
+
+-- Built-in highlight groups, as Neovim has before any colorscheme.
+vim._hl_reset()

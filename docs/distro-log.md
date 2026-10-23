@@ -44,3 +44,4 @@ See `docs/DISTRO-LOOP.md` §3 step 7.
 2026-10-23 DISTRO-121 AstroNvim first run: keytrans + sign_define so astrocore.setup completes | astro keymaps missing 184→5, commands 9→2, opts now match; LazyVim still IDENTICAL; verify 35/35 | commit (this)
 2026-10-23 DISTRO-122 environ, get_runtime_file("") slashes, decoration provider stub, --cmd | astro sections differing 9→6 (g, opts, rtp_count, highlights now match); LazyVim IDENTICAL; verify 36/36 | commit (this)
 2026-10-23 DISTRO-123 vendored LPeg 1.1.0 (vim.lpeg) + vim.version runtime module at 0.12.6 | astro: all core setups succeed, plugins section matches, modules missing 56→6; LazyVim IDENTICAL; verify 38/38 | commit (this)
+2026-10-23 DISTRO-124 built-in highlight groups (generated from oracle), nvim_set_hl replace/update/default, link=false, hlexists, :hi clear/link | astro: heirline setup ok, highlights section matches, sections 6→5; LazyVim IDENTICAL; verify 39/39 | commit (this)
