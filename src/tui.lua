@@ -22,7 +22,8 @@ local S = {
   inject = {}, -- keys fed by noremap mappings; never mapped again
   from_inject = false,
   rbuf = '',
-  reg = { text = { '' }, linewise = false },
+  pending_reg = nil, -- register named with a "x prefix for the current command
+  in_normal = false, -- running :normal; an empty typeahead ends the command
   undo = {},
   redo = {},
   cur_snap = nil,
@@ -666,6 +667,9 @@ local function getkey()
   local k = table.remove(S.inject, 1)
   S.from_inject = k ~= nil
   k = k or table.remove(S.queue, 1)
+  if not k and S.in_normal then
+    return '<Esc>'
+  end
   if not k then
     draw()
     local last_size = S.rows * 1000 + S.cols
@@ -1362,9 +1366,25 @@ end
 
 local insert_mode
 
+-- Yanks/deletes go to the named register (or the 'clipboard' default) and "; yanks also to 0.
+local function reg_write(r, yank)
+  local text, lw = region_text(r), r.linewise
+  local name = S.pending_reg or vim._reg_default()
+  vim._reg_set(name, text, lw)
+  vim._reg_set('"', text, lw)
+  if yank and name == vim._reg_default() then
+    vim._reg_set('0', text, lw)
+  end
+end
+
+local function reg_read()
+  return vim._reg_get(S.pending_reg or vim._reg_default()) or vim._reg_get('"')
+    or { text = { '' }, linewise = false }
+end
+
 local function apply_op(op, r)
   if op == 'y' then
-    S.reg = { text = region_text(r), linewise = r.linewise }
+    reg_write(r, true)
     if r.linewise then
       set_cursor(r.sr, S.row == r.sr and S.col or 0, true)
       local cnt = r.er - r.sr + 1
@@ -1375,7 +1395,7 @@ local function apply_op(op, r)
       set_cursor(r.sr, r.sc)
     end
   elseif op == 'd' then
-    S.reg = { text = region_text(r), linewise = r.linewise }
+    reg_write(r)
     delete_region(r)
     S.changed = true
     local cnt = r.er - r.sr + 1
@@ -1383,7 +1403,7 @@ local function apply_op(op, r)
       info(cnt .. ' fewer lines')
     end
   elseif op == 'c' then
-    S.reg = { text = region_text(r), linewise = r.linewise }
+    reg_write(r)
     S.changed = true
     if r.linewise then
       local indent = ''
@@ -1604,8 +1624,8 @@ end
 
 -- -------------------------------------------------------------------- edits
 
-local function put(after, count)
-  local reg = S.reg
+local function put(after, count, reg)
+  reg = reg or reg_read()
   count = count or 1
   if reg.linewise then
     local text = {}
@@ -2016,6 +2036,12 @@ local function fire_map(entry, typed, depth)
     if ok and map.expr == 1 and type(res) == 'string' then
       rhs = res
     end
+  elseif map.expr == 1 then
+    local ok, res = with_api_cursor(function()
+      return api.nvim_eval(map.rhs)
+    end)
+    failed = not ok
+    rhs = ok and tostring(res) or nil
   else
     rhs = map.rhs
   end
@@ -2032,7 +2058,13 @@ local function fire_map(entry, typed, depth)
       rhs = rest
     end
     local tokens = tokenize(rhs) or {}
-    if map.noremap == 1 then
+    -- <Plug> keys are remapped even in a noremap rhs.
+    -- shortcut: one <Plug> makes the whole rhs remappable; split per key if a plugin mixes them.
+    local plug = false
+    for _, t in ipairs(tokens) do
+      plug = plug or t:match('^<[Pp][Ll][Uu][Gg]>') ~= nil
+    end
+    if map.noremap == 1 and not plug then
       for i = #tokens, 1, -1 do
         table.insert(S.inject, 1, tokens[i])
       end
@@ -2232,13 +2264,13 @@ local function visual_command(k, count)
     join_lines(cr - ar + 1)
   elseif k == 'p' or k == 'P' then
     local region = visual_region()
-    local saved = S.reg
+    local saved = reg_read()
     exit_visual()
-    local old = { text = region_text(region), linewise = region.linewise }
+    local text, lw = region_text(region), region.linewise
     delete_region(region)
-    S.reg = saved
-    put(false, count)
-    S.reg = old
+    put(false, count, saved)
+    vim._reg_set(S.pending_reg or vim._reg_default(), text, lw)
+    vim._reg_set('"', text, lw)
     S.changed = true
   elseif k == ':' then
     exit_visual()
@@ -2259,7 +2291,18 @@ local function visual_command(k, count)
 end
 
 local function normal_command()
+  S.pending_reg = nil
+  vim.v.register = vim._reg_default()
   local k = getkey_cmd()
+  if k == '"' then
+    local name = getkey()
+    if not name:match('^[%w"%-+*_/:.]$') then
+      return
+    end
+    S.pending_reg = name
+    vim.v.register = name
+    k = getkey_cmd()
+  end
   local count
   if k:match('^[1-9]$') then
     count = tonumber(k)
@@ -2511,5 +2554,28 @@ function M.run()
 end
 
 vim._tui_run = M.run
+
+-- :normal[!] {keys}: run the keys as normal-mode commands now; an unfinished
+-- command is ended as if <Esc> was typed. The pending typeahead is kept aside.
+vim._tui_normal = function(keys, noremap)
+  local tokens = raw_to_tokens(api.nvim_replace_termcodes(keys, true, true, true))
+  local saved_queue, saved_inject, saved_in = S.queue, S.inject, S.in_normal
+  local saved_reg = S.pending_reg
+  S.queue, S.inject, S.in_normal = noremap and {} or tokens, noremap and tokens or {}, true
+  pcall(function()
+    local pos = api.nvim_win_get_cursor(0)
+    S.row, S.col = pos[1], pos[2]
+  end)
+  local ok, e = pcall(function()
+    while (#S.queue > 0 or #S.inject > 0) and not S.quit do
+      normal_command()
+    end
+  end)
+  S.queue, S.inject, S.in_normal, S.pending_reg = saved_queue, saved_inject, saved_in, saved_reg
+  pcall(api.nvim_win_set_cursor, 0, { S.row, S.col })
+  if not ok then
+    error(e, 0)
+  end
+end
 
 return M

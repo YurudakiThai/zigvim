@@ -716,7 +716,17 @@ fn luaTtyRead(L: ?*c.lua_State) callconv(.c) c_int {
     const LS: *c.lua_State = @ptrCast(L.?);
     const timeout: c_int = @intCast(c.luaL_optinteger(LS, 1, 100));
     var pfd = c.struct_pollfd{ .fd = 0, .events = c.POLLIN, .revents = 0 };
-    const ready = c.poll(&pfd, 1, timeout);
+    // Wait in slices so vim.schedule / timers (e.g. lazy.nvim's VeryLazy) run while the TUI idles.
+    var waited: c_int = 0;
+    var ready: c_int = 0;
+    while (true) {
+        _ = c.uv_run(getLoop(), c.UV_RUN_NOWAIT);
+        pumpEventLoop(LS);
+        const slice: c_int = @min(10, timeout - waited);
+        ready = c.poll(&pfd, 1, @max(slice, 0));
+        waited += slice;
+        if (ready != 0 or waited >= timeout) break;
+    }
     if (ready <= 0) {
         c.lua_pushstring(LS, "");
         return 1;

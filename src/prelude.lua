@@ -1580,6 +1580,11 @@ local function exec_cmd(cmd)
 
   if name == 'silent' or name == 'silent!' then
     exec_cmd(rest)
+  elseif name == 'normal' or name == 'normal!' or name == 'norm' or name == 'norm!' then
+    -- shortcut: only runs while the TUI is active; headless :normal is a no-op.
+    if vim._tui_normal then
+      vim._tui_normal(rest, name:sub(-1) == '!')
+    end
   elseif name == 'edit' or name == 'e' then
     local path = rest ~= '' and rest or vim.api.nvim_buf_get_name(0)
     if path == '' then
@@ -2517,6 +2522,7 @@ local vvars = {
   register = '"',
   operator = '',
   dying = 0,
+  exiting = vim.NIL, -- lazy.nvim skips VeryLazy unless this is vim.NIL
   exception = '',
   statusmsg = '',
   warningmsg = '',
@@ -2884,6 +2890,8 @@ local function make_keymap(mode, lhs, rhs, opts)
     mode = norm_mode(mode),
     noremap = opts.noremap == true and 1 or 0,
     silent = opts.silent and 1 or 0,
+    expr = opts.expr and 1 or 0,
+    nowait = opts.nowait and 1 or 0,
     desc = opts.desc,
     callback = type(rhs) == 'function' and rhs or nil,
     rhs = type(rhs) == 'function' and '' or tostring(rhs or ''),
@@ -3038,7 +3046,9 @@ end
 
 vim.keymap = {
   set = function(modes, lhs, rhs, opts)
-    opts = opts or {}
+    opts = vim.deepcopy(opts or {})
+    opts.noremap = not opts.remap
+    opts.remap = nil
     local mode_list = type(modes) == 'table' and modes or { modes }
     for _, mode in ipairs(mode_list) do
       if opts.buffer then
@@ -4063,6 +4073,215 @@ do
   vim.api.nvim_create_namespace = vim.api.nvim_create_namespace
 end
 
+-- ------------------------------------------------- Vimscript expression eval
+-- shortcut: the subset mapping <expr>s use (literals, v:/g:/b:/w:/&option vars,
+-- ?:, || &&, comparisons, + - * / % . .., !, unary -, [i], fn calls). No lists,
+-- dicts, lambdas or slices; add them when a plugin needs them.
+do
+  local function num(v)
+    if type(v) == 'number' then
+      return v
+    elseif type(v) == 'boolean' then
+      return v and 1 or 0
+    end
+    return tonumber(tostring(v):match('^%s*(-?%d+)')) or 0
+  end
+
+  local function str(v)
+    if type(v) == 'boolean' then
+      return v and 'v:true' or 'v:false'
+    end
+    return v == nil and '' or tostring(v)
+  end
+
+  local function eval(src)
+    local pos = 1
+    local function skip()
+      pos = src:match('^%s*()', pos)
+    end
+    local function peek(pat)
+      skip()
+      return src:match('^' .. pat, pos)
+    end
+    local function take(pat)
+      local m = peek(pat)
+      if m then
+        pos = pos + #m
+      end
+      return m
+    end
+    local function fail()
+      error('E15: Invalid expression: "' .. src .. '"', 0)
+    end
+
+    local expr1
+    local function primary()
+      local v
+      if take('%(') then
+        v = expr1()
+        if not take('%)') then
+          fail()
+        end
+      elseif peek("'") then
+        local s, e = src:match("^'(.-)'()", pos)
+        while s and src:sub(e, e) == "'" do -- '' is a quote inside '...'
+          local more, e2 = src:match("^'(.-)'()", e)
+          s, e = s .. "'" .. (more or ''), e2
+        end
+        if not s then
+          fail()
+        end
+        v, pos = s, e
+      elseif peek('"') then
+        local s, e = src:match('^"(.-[^\\]?)"()', pos)
+        if not s then
+          fail()
+        end
+        v, pos = s:gsub('\\(.)', { n = '\n', t = '\t', ['\\'] = '\\', ['"'] = '"' }), e
+      elseif peek('%d') then
+        v = tonumber(take('0[xX]%x+') or take('%d+'))
+      elseif peek('&') then
+        take('&')
+        local scope = take('[lg]:') or ''
+        local name = take('[%w_]+') or fail()
+        v = scope == 'l:' and vim.opt_local[name]:get() or vim.o[name]
+      elseif peek('[%a_]') then
+        local scope = take('[vgbwtsl]:') or ''
+        local name = take('[%w_#]+') or fail()
+        if take('%(') then
+          local args = {}
+          if not take('%)') then
+            repeat
+              args[#args + 1] = expr1()
+            until not take(',')
+            if not take('%)') then
+              fail()
+            end
+          end
+          local f = vim.fn[scope .. name]
+          v = f(unpack(args))
+        else
+          local tbl = ({ ['v:'] = vim.v, ['g:'] = vim.g, ['b:'] = vim.b, ['w:'] = vim.w, ['t:'] = vim.t })[scope]
+          if not tbl then
+            error('E121: Undefined variable: ' .. scope .. name, 0)
+          end
+          v = tbl[name]
+          if v == nil then
+            error('E121: Undefined variable: ' .. scope .. name, 0)
+          end
+        end
+      else
+        fail()
+      end
+      while take('%[') do
+        local i = num(expr1())
+        if not take('%]') then
+          fail()
+        end
+        v = str(v):sub(i + 1, i + 1)
+      end
+      return v
+    end
+    local function unary()
+      if take('!') then
+        return num(unary()) == 0 and 1 or 0
+      elseif take('%-') then
+        return -num(unary())
+      elseif take('%+') then
+        return num(unary())
+      end
+      return primary()
+    end
+    local function mul()
+      local v = unary()
+      while true do
+        local op = take('[%*/%%]')
+        if not op then
+          return v
+        end
+        local r = num(unary())
+        v = num(v)
+        v = op == '*' and v * r or (r == 0 and 0 or (op == '/' and (v / r >= 0 and math.floor(v / r) or math.ceil(v / r)) or math.fmod(v, r)))
+      end
+    end
+    local function add()
+      local v = mul()
+      while true do
+        local op = take('%.%.') or take('%.') or take('[%+%-]')
+        if not op then
+          return v
+        end
+        local r = mul()
+        if op == '+' then
+          v = num(v) + num(r)
+        elseif op == '-' then
+          v = num(v) - num(r)
+        else
+          v = str(v) .. str(r)
+        end
+      end
+    end
+    local function cmp()
+      local v = add()
+      local op = take('[=!]=[#?]?') or take('[<>]=?[#?]?')
+      if not op then
+        return v
+      end
+      local r = add()
+      local base, ic = op:gsub('[#?]$', ''), op:sub(-1) == '?'
+      local a, b
+      if type(v) == 'string' and type(r) == 'string' then
+        a, b = ic and v:lower() or v, ic and r:lower() or r
+      else
+        a, b = num(v), num(r)
+      end
+      local res = (base == '==' and a == b) or (base == '!=' and a ~= b) or (base == '<' and a < b)
+        or (base == '>' and a > b) or (base == '<=' and a <= b) or (base == '>=' and a >= b)
+      return res and 1 or 0
+    end
+    local function land()
+      local v = cmp()
+      while take('&&') do
+        local r = cmp()
+        v = (num(v) ~= 0 and num(r) ~= 0) and 1 or 0
+      end
+      return v
+    end
+    local function lor()
+      local v = land()
+      while take('||') do
+        local r = land()
+        v = (num(v) ~= 0 or num(r) ~= 0) and 1 or 0
+      end
+      return v
+    end
+    expr1 = function()
+      local v = lor()
+      if take('%?') then
+        local a = expr1()
+        if not take(':') then
+          fail()
+        end
+        local b = expr1()
+        return num(v) ~= 0 and a or b
+      end
+      return v
+    end
+
+    local v = expr1()
+    skip()
+    if pos <= #src then
+      fail()
+    end
+    return v
+  end
+
+  vim.api.nvim_eval = function(expr)
+    return eval(tostring(expr))
+  end
+  vim.fn.eval = vim.api.nvim_eval
+end
+
 -- ---------------------------------------------------- vim.fn editing helpers
 do
   local registers = {}
@@ -4261,23 +4480,67 @@ do
     return vim.fn.getwinvar(win, name, default)
   end
 
-  function vim.fn.getreg(reg, ...)
-    reg = reg == nil or reg == '' and '"' or tostring(reg)
-    return registers[reg] or ''
+  local function reg_name(reg)
+    return (reg == nil or reg == '') and '"' or tostring(reg)
+  end
+
+  -- Registers hold { text = lines, linewise = bool }; the TUI shares this store.
+  -- shortcut: '+' and '*' are plain internal registers, no system clipboard provider.
+  function vim._reg_get(reg)
+    return registers[reg_name(reg)]
+  end
+
+  function vim._reg_set(reg, lines, linewise)
+    registers[reg_name(reg)] = { text = lines, linewise = linewise and true or false }
+  end
+
+  -- The register an unprefixed yank/put uses, following 'clipboard'.
+  function vim._reg_default()
+    local cb = vim.o.clipboard or ''
+    if cb:find('unnamedplus', 1, true) then
+      return '+'
+    elseif cb:find('unnamed', 1, true) then
+      return '*'
+    end
+    return '"'
+  end
+
+  function vim.fn.getreg(reg, _, list)
+    local r = registers[reg_name(reg)]
+    if list and list ~= 0 then
+      return r and vim.deepcopy(r.text) or {}
+    end
+    if not r then
+      return ''
+    end
+    return table.concat(r.text, '\n') .. (r.linewise and '\n' or '')
   end
 
   function vim.fn.setreg(reg, value, opts)
-    reg = tostring(reg == nil or reg == '' and '"' or reg)
-    registers[reg] = value
+    opts = type(opts) == 'string' and opts or ''
+    local lines, linewise
+    if type(value) == 'table' then
+      lines, linewise = vim.deepcopy(value), true
+    else
+      value = tostring(value)
+      linewise = value:sub(-1) == '\n'
+      lines = vim.split(linewise and value:sub(1, -2) or value, '\n', { plain = true })
+    end
+    if opts:find('[lV]') then
+      linewise = true
+    elseif opts:find('[cvb]') then
+      linewise = false
+    end
+    vim._reg_set(reg, lines, linewise)
     return 0
   end
 
   function vim.fn.getregtype(reg)
-    reg = tostring(reg == nil or reg == '' and '"' or reg)
-    if registers[reg] == nil then
+    local r = registers[reg_name(reg)]
+    if r == nil then
       return ''
     end
-    return 'v'
+    return r.linewise and 'V' or 'v'
   end
 
   function vim.fn.strchars(s)
