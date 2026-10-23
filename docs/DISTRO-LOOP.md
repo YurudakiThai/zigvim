@@ -11,7 +11,7 @@
 zigvim is "done" for a distribution when **all** of these hold:
 
 1. `python3 scripts/distro_diff.py --config <distro>` prints `IDENTICAL`.
-2. `./scripts/verify.sh all` — every case passes (currently 30/30).
+2. `./scripts/verify.sh all` — every case passes (currently 40/40).
 3. `python3 scripts/tui_smoke.py --clean --nvim` — 100% and agrees with real nvim.
 4. `python3 scripts/tui_smoke.py` (your real config loaded) — 100%.
 5. Starting the distribution prints **no** error or warning that real nvim does not print.
@@ -177,7 +177,19 @@ The harness takes any config dir; the distro runs against a **sandbox copy**.
 
 **LazyVim (your current setup)** — `python3 scripts/distro_diff.py`
 
-**AstroNvim** — *not yet run; treat the first run as exploratory:*
+**AstroNvim** — run since 2026-10-23 (DISTRO-121..126). Its remaining diff is
+nondeterministic upstream or out of scope (see `tasks/TASK-127.md`). Install the
+plugins once into a persistent HOME and pass it as `--data`, so iterations take
+seconds instead of re-cloning:
+```bash
+mkdir -p /tmp/astro-home/.config && cp -R /tmp/astro-template /tmp/astro-home/.config/nvim
+HOME=/tmp/astro-home nvim --headless "+Lazy! sync" +qa
+python3 scripts/distro_diff.py --config /tmp/astro-template --data /tmp/astro-home/.local/share/nvim
+```
+To see errors lazy.nvim swallows during startup, wrap a plugin's `setup` from
+`--cmd "luafile hook.lua"` (zigvim supports `--cmd`) and log `xpcall` tracebacks.
+
+First-run recipe:
 ```bash
 git clone --depth 1 https://github.com/AstroNvim/template /tmp/astro-template
 rm -rf /tmp/astro-template/.git
