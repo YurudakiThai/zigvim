@@ -4689,6 +4689,11 @@ do
     return id
   end
 
+  -- Stub for internal Neovim API function used by gitsigns and other plugins.
+  -- Sets metadata for a namespace (e.g., { wins = {} }). Currently a no-op.
+  vim.api.nvim__ns_set = function(ns, opts)
+    -- No-op: zigvim does not currently track namespace metadata
+  end
   vim.api.nvim_get_namespaces = function()
     local out = {}
     for name, id in pairs(namespace_names) do
@@ -5157,6 +5162,16 @@ do
           details.priority = details.priority or 4096
           if details.right_gravity == nil then
             details.right_gravity = true
+          end
+          if details.end_col or details.end_row then
+            details.end_row = details.end_row or mark.row
+            details.end_right_gravity = details.end_right_gravity or false
+            details.hl_eol = details.hl_eol or false
+          end
+          if details.virt_text then
+            details.virt_text_pos = details.virt_text_pos or 'eol'
+            details.virt_text_hide = mark.virt_text_hide or false
+            details.virt_text_repeat_linebreak = mark.virt_text_repeat_linebreak or false
           end
           out[#out + 1] = { mark.id, mark.row, mark.col, details }
         else

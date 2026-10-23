@@ -505,6 +505,25 @@ local function collect_signs(top, bot)
   return by_row
 end
 
+-- 'eol' virtual text per buffer row (0-based) in [top, bot], in extmark order.
+-- shortcut: only virt_text_pos 'eol'; overlay/right_align/inline are not drawn.
+local function collect_virt_text(top, bot)
+  local by_row = {}
+  local marks = api.nvim_buf_get_extmarks(0, -1, { top - 1, 0 }, { bot - 1, -1 }, { details = true, type = 'virt_text' })
+  for _, m in ipairs(marks) do
+    local d = m[4]
+    if d.virt_text and (d.virt_text_pos or 'eol') == 'eol' then
+      local row = by_row[m[2]] or {}
+      by_row[m[2]] = row
+      for _, chunk in ipairs(d.virt_text) do
+        local hl = chunk[2]
+        row[#row + 1] = { chunk[1], type(hl) == 'table' and hl[#hl] or hl }
+      end
+    end
+  end
+  return by_row
+end
+
 local function hl_escape(name)
   if not name then
     return ''
@@ -574,6 +593,7 @@ local function draw()
     textcols = math.max(1, cols - sw - gw)
   end
   local signs = sw > 0 and collect_signs(S.top, bot) or {}
+  local vtext = collect_virt_text(S.top, bot)
   local vr1, vc1, vr2, vc2
   if S.mode == 'v' or S.mode == 'V' then
     vr1, vc1, vr2, vc2 = visual_bounds()
@@ -627,6 +647,22 @@ local function draw()
         end
       end
       out[#out + 1] = render_line(text, S.left, textcols, selfn)
+      local vt = vtext[lnum - 1]
+      if vt then
+        local _, total = cells(text)
+        local room = textcols - math.max(0, total - S.left) - 1
+        if room > 0 then
+          out[#out + 1] = ' '
+          for _, chunk in ipairs(vt) do
+            if room <= 0 then
+              break
+            end
+            local t = truncate(chunk[1], room)
+            room = room - str_width(t)
+            out[#out + 1] = hl_escape(chunk[2]) .. t .. '\27[0m'
+          end
+        end
+      end
     else
       out[#out + 1] = '\27[38;5;240m~\27[0m'
     end
@@ -2046,6 +2082,8 @@ local function ex(line)
     end
   end
   local function write_file(path)
+    local target = path ~= '' and path or api.nvim_buf_get_name(0)
+    local is_new = target ~= '' and vim.uv.fs_stat(vim.fn.expand(target)) == nil
     local ok, e = pcall(vim.cmd, 'write ' .. path)
     if not ok then
       err(clean_error(e))
@@ -2053,7 +2091,8 @@ local function ex(line)
     end
     local nl, nb = buffer_stats()
     local fname = vim._buf_short_name(0)
-    info(string.format('"%s" %dL, %dB written', fname, nl, nb))
+    local sm = vim.o.shortmess
+    info(string.format('"%s" %s%dL, %dB%s', fname, is_new and '[New] ' or '', nl, nb, sm:find('W', 1, true) and '' or ' written'))
     return true
   end
   if name == 'q' or name == 'quit' or name == 'qa' or name == 'qall' or name == 'quita' or name == 'quitall' or name == 'close' or name == 'clo' then
