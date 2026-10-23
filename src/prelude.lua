@@ -2363,6 +2363,81 @@ vim.api.nvim_replace_termcodes = function(str, from_part, do_lt, special)
   return table.concat(out)
 end
 
+-- keytrans: raw keys -> <> notation. zigvim's replace_termcodes already emits
+-- canonical <...> tokens instead of Neovim's K_SPECIAL bytes, so those are kept.
+-- shortcut: a literal "<CR>"-like text typed as plain chars is indistinguishable
+-- from the key; fix together with byte-accurate replace_termcodes.
+do
+  local canonical = {}
+  for _, v in pairs(special_key_names) do
+    canonical[v] = true
+  end
+  local raw_names = { [' '] = '<Space>', ['<'] = '<lt>', ['\r'] = '<CR>', ['\n'] = '<NL>', ['\27'] = '<Esc>', ['\t'] = '<Tab>', ['\0'] = '<Nul>', ['\127'] = '' }
+  function vim.fn.keytrans(s)
+    s = tostring(s)
+    local out, i = {}, 1
+    while i <= #s do
+      local tok = s:match('^<[^<>]+>', i)
+      if tok and (canonical[tok] or tok:match('^<[CMSAD]%-.+>$') or tok:match('^<F%d+>$') or tok:match('^<[Pp]lug>')) then
+        out[#out + 1] = tok
+        i = i + #tok
+      else
+        local ch = s:match('^[%z\1-\127\194-\244][\128-\191]*', i) or s:sub(i, i)
+        local b = ch:byte()
+        out[#out + 1] = raw_names[ch] or (b < 32 and '<C-' .. string.char(b + 64) .. '>') or ch
+        i = i + #ch
+      end
+    end
+    return table.concat(out)
+  end
+end
+
+-- Sign definitions. shortcut: definitions only; sign_place and drawing signs in the TUI are not done.
+do
+  local signs, order = {}, {}
+  local function define(name, dict)
+    local def = { name = name }
+    for k, v in pairs(dict or {}) do
+      def[k] = v
+    end
+    if def.text and vim.fn.strdisplaywidth(def.text) > 2 then
+      error('Vim:E239: Invalid sign text: ' .. def.text, 0)
+    end
+    if not signs[name] then
+      order[#order + 1] = name
+    end
+    signs[name] = def
+    return 0
+  end
+  function vim.fn.sign_define(name, dict)
+    if type(name) == 'table' then
+      local res = {}
+      for i, d in ipairs(name) do
+        res[i] = define(d.name, d)
+      end
+      return res
+    end
+    return define(name, dict)
+  end
+  function vim.fn.sign_getdefined(name)
+    local res = {}
+    for _, n in ipairs(order) do
+      if signs[n] and (name == nil or name == n) then
+        res[#res + 1] = vim.deepcopy(signs[n])
+      end
+    end
+    return res
+  end
+  function vim.fn.sign_undefine(name)
+    if name == nil then
+      signs, order = {}, {}
+    else
+      signs[name] = nil
+    end
+    return 0
+  end
+end
+
 -- Minimal vim.loader: Neovim's own implementation needs far more of the uv
 -- API than zigvim provides. Module lookup goes through the rtp searcher above,
 -- so enable()/disable() are no-ops; find() is used by lazy.nvim.
