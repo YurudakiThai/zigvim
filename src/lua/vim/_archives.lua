@@ -182,14 +182,13 @@ for _, ext in ipairs(zip_extensions) do
   zip_patterns[#zip_patterns + 1] = '*' .. ext
 end
 
-function M.setup()
+-- One function per Neovim plugin file (plugin/gzip.vim, tarPlugin.vim, zipPlugin.vim),
+-- so each can be disabled on its own.
+function M.setup_gzip()
   if vim.g.loaded_gzip then
     return
   end
   vim.g.loaded_gzip = 1
-  vim.g.loaded_tar = 1
-  vim.g.loaded_zip = 1
-
   local gzip = api.nvim_create_augroup('gzip', { clear = true })
   api.nvim_create_autocmd('BufReadPre', {
     group = gzip,
@@ -213,7 +212,13 @@ function M.setup()
       write_compressed(ev.match)
     end,
   })
+end
 
+function M.setup_tar()
+  if vim.g.loaded_tar then
+    return
+  end
+  vim.g.loaded_tar = 1
   local tar = api.nvim_create_augroup('tar', { clear = true })
   api.nvim_create_autocmd('BufReadCmd', {
     group = tar,
@@ -229,7 +234,13 @@ function M.setup()
       error('tar: writing archive members is not supported yet', 0)
     end,
   })
+end
 
+function M.setup_zip()
+  if vim.g.loaded_zip then
+    return
+  end
+  vim.g.loaded_zip = 1
   local zip = api.nvim_create_augroup('zip', { clear = true })
   api.nvim_create_autocmd('BufReadCmd', {
     group = zip,

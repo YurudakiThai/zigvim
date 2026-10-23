@@ -4,6 +4,7 @@ vim.g.mapleader = ' '
 local keys = {
   '<Leader>ff', '<leader>q', '<C-H>', '<c-s>', '<F7>', '<C-Space>', '<cr>', '<Esc>',
   '<Tab>', '<S-Tab>', '<M-x>', '<Up>', '<BS>', 'gx', '<lt>', '\\', '|', 'é',
+  '<F17>', '<f29>', '<S-F17>', '<C-J>', '<C-j>', '<C-M>', '<C-I>', '<C-[>', '<C-@>', '<NL>', '<C-^>', '<C-]>',
 }
 local out = {}
 for i, k in ipairs(keys) do

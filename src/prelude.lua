@@ -2279,7 +2279,11 @@ local special_key_names = {
   ['<bslash>'] = '<Bslash>', ['<Bslash>'] = '<Bslash>',
   ['<nul>'] = '<Nul>', ['<Nul>'] = '<Nul>',
   ['<nop>'] = '<Nop>', ['<Nop>'] = '<Nop>',
+  ['<nl>'] = '<NL>', ['<NL>'] = '<NL>',
 }
+for n = 13, 37 do -- <F1>..<F12> are listed above
+  special_key_names['<f' .. n .. '>'] = '<F' .. n .. '>'
+end
 
 vim.api.nvim_replace_termcodes = function(str, from_part, do_lt, special)
   if type(str) ~= 'string' then
@@ -2381,6 +2385,8 @@ do
   for _, v in pairs(special_key_names) do
     canonical[v] = true
   end
+  -- Control keys that are the same byte as a named key.
+  local same_byte = { ['<C-J>'] = '<NL>', ['<C-M>'] = '<CR>', ['<C-I>'] = '<Tab>', ['<C-[>'] = '<Esc>', ['<C-@>'] = '<Nul>', ['<C-?>'] = '' }
   local raw_names = { [' '] = '<Space>', ['<'] = '<lt>', ['\r'] = '<CR>', ['\n'] = '<NL>', ['\27'] = '<Esc>', ['\t'] = '<Tab>', ['\0'] = '<Nul>', ['\127'] = '' }
   function vim.fn.keytrans(s)
     s = tostring(s)
@@ -2388,7 +2394,7 @@ do
     while i <= #s do
       local tok = s:match('^<[^<>]+>', i)
       if tok and (canonical[tok] or tok:match('^<[CMSAD]%-.+>$') or tok:match('^<F%d+>$') or tok:match('^<[Pp]lug>')) then
-        out[#out + 1] = tok
+        out[#out + 1] = same_byte[tok] or tok
         i = i + #tok
       else
         local ch = s:match('^[%z\1-\127\194-\244][\128-\191]*', i) or s:sub(i, i)
@@ -2529,39 +2535,14 @@ function vim._startup(skip_user_config)
     end
   end
 
-  -- Load netrw after init.lua so plugins can disable it via g:loaded_netrw
-  local ok_netrw, netrw = pcall(require, 'vim._netrw')
-  if ok_netrw then
-    netrw.setup()
-  else
-    io.stderr:write('Warning: failed to load vim._netrw: ' .. tostring(netrw) .. '\n')
-  end
-
-  -- tutor.vim is not sourced in Neovim 0.12.6 with user configs (only in --clean mode).
-  -- We load it only in clean mode to match real nvim's behavior.
-  if skip_user_config then
-    local ok_tutor, tutor = pcall(require, 'vim._tutor')
-    if ok_tutor then
-      tutor.setup()
-    end
-  end
-
-  -- gzip.vim / tarPlugin.vim / zipPlugin.vim: compressed files and archives.
-  -- These .vim plugins are not sourced in Neovim 0.12.6 with user configs (only in --clean mode).
-  -- We load them only in clean mode to match real nvim's behavior.
-  if skip_user_config then
-    local ok_archives, archives = pcall(require, 'vim._archives')
-    if ok_archives then
-      archives.setup()
-    end
-  end
-
   -- Neovim enables filetype detection, ftplugins, indent and syntax between
   -- init.lua and the runtime plugins; plugins may rely on it being on.
   vim._setup_filetype()
 
-  -- Source runtime plugins (plugin/*.lua files from runtime path)
-  local rtp = vim.o.runtimepath
+  -- Source runtime plugins (plugin/*.lua files from runtime path). netrw, tutor and the
+  -- archive plugins are runtime/plugin/*.lua files too, so a config (or lazy.nvim, which
+  -- sources plugins itself and then turns 'loadplugins' off) can skip them by name.
+  local rtp = vim.go.loadplugins and vim.o.runtimepath
   if rtp and rtp ~= '' then
     for dir in rtp:gmatch('[^,]+') do
       local plugin_dir = dir .. '/plugin'
@@ -2571,16 +2552,10 @@ function vim._startup(skip_user_config)
         table.sort(files)  -- Sort to ensure consistent loading order
         for _, name in ipairs(files) do
           if name:match('%.lua$') then
-            -- Check if plugin is disabled via g:loaded_<plugin>
-            local plugin_name = name:sub(1, -5)  -- Remove .lua extension
-            if vim.g['loaded_' .. plugin_name] then
-              -- Plugin is disabled, skip it
-            else
-              local plugin_path = plugin_dir .. '/' .. name
-              local plugin_ok, plugin_err = pcall(dofile, plugin_path)
-              if not plugin_ok then
-                io.stderr:write('Error in ' .. plugin_path .. ': ' .. tostring(plugin_err) .. '\n')
-              end
+            local plugin_path = plugin_dir .. '/' .. name
+            local plugin_ok, plugin_err = pcall(dofile, plugin_path)
+            if not plugin_ok then
+              io.stderr:write('Error in ' .. plugin_path .. ': ' .. tostring(plugin_err) .. '\n')
             end
           end
           -- Skip .vim files for now (no Vimscript engine yet)
