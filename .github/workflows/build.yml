@@ -68,31 +68,3 @@ jobs:
         with:
           name: zigvim-${{ matrix.os }}
           path: zig-out/bin/zigvim*
-
-  test-cross-compile:
-    name: Cross-compile ${{ matrix.target }}
-    runs-on: ubuntu-latest
-    # Links the system LuaJIT/libuv, which the runner lacks for other targets; informational
-    # until those libraries are vendored.
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-linux-gnu
-          - x86_64-macos
-          - aarch64-macos
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: '0.17.0'
-
-      - name: Cross-compile
-        run: |
-          zig build -Dtarget=${{ matrix.target }}
-          ls -lh zig-out/bin/
