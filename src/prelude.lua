@@ -2210,7 +2210,7 @@ end
 
 -- Like Neovim: a callback error is reported, not raised into the edit, and a
 -- callback returning true detaches.
-local function fire_buf_attach(buf, firstline, lastline, new_lastline)
+local function fire_buf_attach(buf, firstline, lastline, new_lastline, byte_count)
   local callbacks = buffer_attach_callbacks[buf]
   if not callbacks then
     return
@@ -2219,7 +2219,7 @@ local function fire_buf_attach(buf, firstline, lastline, new_lastline)
     local opts = callbacks[i]
     if opts.on_lines then
       local tick = vim.api.nvim_buf_get_changedtick and vim.api.nvim_buf_get_changedtick(buf) or 0
-      local ok, res = pcall(opts.on_lines, 'lines', buf, tick, firstline, lastline, new_lastline)
+      local ok, res = pcall(opts.on_lines, 'lines', buf, tick, firstline, lastline, new_lastline, byte_count or 0)
       if not ok then
         vim.notify('Error in on_lines callback: ' .. tostring(res), vim.log.levels.ERROR)
       elseif res == true then
@@ -4135,6 +4135,13 @@ do
       end_ = n + end_ + 1
     end
     start, end_ = math.min(start, n), math.min(end_, n)
+    -- on_lines' byte_count: size of the replaced lines, newlines included
+    local byte_count = 0
+    if buffer_attach_callbacks[id] and end_ > start then
+      for _, l in ipairs(vim.api.nvim_buf_get_lines(id, start, end_, false)) do
+        byte_count = byte_count + #l + 1
+      end
+    end
     local result = raw_set_lines(id, start, end_, strict, lines)
     bump_tick(id)
     local count = 0
@@ -4143,7 +4150,7 @@ do
         count = count + 1
       end
     end
-    fire_buf_attach(id, start, end_, start + count)
+    fire_buf_attach(id, start, end_, start + count, byte_count)
     return result
   end
 
@@ -6536,6 +6543,34 @@ end
 -- vim.diff (Neovim: xdiff in C); vim.text.diff calls it.
 function vim.diff(a, b, opts)
   return require('vim._diff').diff(a, b, opts)
+end
+
+-- luv's async form: fs_*(..., callback) runs and calls callback(err, result) later.
+-- shortcut: the work itself is still synchronous; only the callback is deferred.
+for name, fn in pairs(vim.uv) do
+  if type(name) == 'string' and name:match('^fs_') and name ~= 'fs_scandir_next' and type(fn) == 'function' then
+    vim.uv[name] = function(...)
+      local n = select('#', ...)
+      local cb = n > 0 and select(n, ...) or nil
+      if type(cb) ~= 'function' then
+        return fn(...)
+      end
+      local args = { ... }
+      args[n] = nil
+      local res = { pcall(fn, unpack(args, 1, n - 1)) }
+      vim.schedule(function()
+        if not res[1] then
+          cb(tostring(res[2]))
+        elseif res[2] == nil then
+          -- luv's failure: nil, "ENAME: message: path" (the sync side may not say why)
+          cb(res[3] or ('ENOENT: no such file or directory: ' .. tostring(args[1])))
+        else
+          cb(nil, unpack(res, 2))
+        end
+      end)
+      return 0
+    end
+  end
 end
 
 -- vim.system(), as vim._init_packages loads it (built on vim.uv.spawn / new_pipe).

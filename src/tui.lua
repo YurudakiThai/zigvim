@@ -1822,8 +1822,21 @@ local function join_lines(count)
   S.changed = true
 end
 
+-- Replace only the lines that differ, so buffer listeners (gitsigns, LSP) see the
+-- same narrow change events Neovim's undo produces.
 local function undo_restore(snap)
-  api.nvim_buf_set_lines(0, 0, -1, false, snap.lines)
+  local cur, new = api.nvim_buf_get_lines(0, 0, -1, false), snap.lines
+  local pre = 0
+  while pre < #cur and pre < #new and cur[pre + 1] == new[pre + 1] do
+    pre = pre + 1
+  end
+  local suf = 0
+  while suf < #cur - pre and suf < #new - pre and cur[#cur - suf] == new[#new - suf] do
+    suf = suf + 1
+  end
+  if pre < #cur - suf or pre < #new - suf then
+    api.nvim_buf_set_lines(0, pre, #cur - suf, false, { unpack(new, pre + 1, #new - suf) })
+  end
   S.mode = 'n'
   set_cursor(snap.row, snap.col)
 end

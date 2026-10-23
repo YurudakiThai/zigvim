@@ -1369,6 +1369,7 @@ const TimerBox = struct {
     handle: c.uv_timer_t = undefined,
     ref: c_int = c.LUA_NOREF,
     self_ref: c_int = c.LUA_NOREF,
+    close_ref: c_int = c.LUA_NOREF, // timer:close(cb)
 };
 
 fn boxFromSelf(L: *c.lua_State) ?*TimerBox {
@@ -1450,6 +1451,10 @@ fn luaTimerClose(L: ?*c.lua_State) callconv(.c) c_int {
     if (boxFromSelf(LS)) |box| {
         if (c.uv_is_closing(@ptrCast(&box.handle)) != 0) return 0;
         _ = c.uv_timer_stop(&box.handle);
+        if (c.lua_isfunction(LS, 2)) {
+            c.lua_pushvalue(LS, 2);
+            box.close_ref = c.luaL_ref(LS, c.LUA_REGISTRYINDEX);
+        }
         c.uv_close(@ptrCast(&box.handle), timerCloseCallback);
     }
     return 0;
@@ -1497,6 +1502,11 @@ fn timerCloseCallback(handle: [*c]c.uv_handle_t) callconv(.c) void {
     if (g_L) |L| {
         if (box.ref != c.LUA_NOREF) c.luaL_unref(L, c.LUA_REGISTRYINDEX, box.ref);
         uvDetachObject(L, box.self_ref, "__handle");
+        if (box.close_ref != c.LUA_NOREF) {
+            c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, box.close_ref);
+            c.luaL_unref(L, c.LUA_REGISTRYINDEX, box.close_ref);
+            uvCall(L, 0);
+        }
     }
     std.heap.page_allocator.destroy(box);
 }
