@@ -79,6 +79,9 @@ jobs:
   test-cross-compile:
     name: Cross-compile ${{ matrix.target }}
     runs-on: ubuntu-latest
+    # Links the system LuaJIT/libuv, which the runner lacks for other targets; informational
+    # until those libraries are vendored.
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
