@@ -521,6 +521,16 @@ fn registerVimGlobal(L: *c.lua_State) !void {
     c.lua_newtable(L);
     c.lua_pushcfunction(L, luaUvNewTimer);
     c.lua_setfield(L, -2, "new_timer");
+    c.lua_pushcfunction(L, luaUvNewPipe);
+    c.lua_setfield(L, -2, "new_pipe");
+    c.lua_pushcfunction(L, luaUvSpawn);
+    c.lua_setfield(L, -2, "spawn");
+    c.lua_pushcfunction(L, luaUvNewCheck);
+    c.lua_setfield(L, -2, "new_check");
+    c.lua_pushcfunction(L, luaUvKill);
+    c.lua_setfield(L, -2, "kill");
+    c.lua_pushcfunction(L, luaUvNewFsEvent);
+    c.lua_setfield(L, -2, "new_fs_event");
     c.lua_pushcfunction(L, luaUvVersion);
     c.lua_setfield(L, -2, "version");
     c.lua_pushcfunction(L, luaUvVersionString);
@@ -589,6 +599,7 @@ const embedded_lua_modules = [_]struct { name: [:0]const u8, source: [:0]const u
     .{ .name = "vim._tutor", .source = @embedFile("lua/vim/_tutor.lua") },
     .{ .name = "vim._remote", .source = @embedFile("lua/vim/_remote.lua") },
     .{ .name = "vim._default_hl", .source = @embedFile("lua/vim/_default_hl.lua") },
+    .{ .name = "vim._diff", .source = @embedFile("lua/vim/_diff.lua") },
 };
 
 /// Expose the embedded modules as a global table that prelude.lua turns into a
@@ -1344,6 +1355,7 @@ fn luaWait(L: ?*c.lua_State) callconv(.c) c_int {
 const TimerBox = struct {
     handle: c.uv_timer_t = undefined,
     ref: c_int = c.LUA_NOREF,
+    self_ref: c_int = c.LUA_NOREF,
 };
 
 fn boxFromSelf(L: *c.lua_State) ?*TimerBox {
@@ -1379,10 +1391,20 @@ fn luaUvNewTimer(L: ?*c.lua_State) callconv(.c) c_int {
     c.lua_setfield(LS, -2, "stop");
     c.lua_pushcfunction(LS, luaTimerClose);
     c.lua_setfield(LS, -2, "close");
+    c.lua_pushcfunction(LS, luaTimerIsClosing);
+    c.lua_setfield(LS, -2, "is_closing");
+    c.lua_pushcfunction(LS, luaTimerIsActive);
+    c.lua_setfield(LS, -2, "is_active");
+    c.lua_pushcfunction(LS, luaTimerRef);
+    c.lua_setfield(LS, -2, "ref");
+    c.lua_pushcfunction(LS, luaTimerUnref);
+    c.lua_setfield(LS, -2, "unref");
     // Make method lookup work: metatable.__index = metatable.
     c.lua_pushvalue(LS, -1);
     c.lua_setfield(LS, -2, "__index");
     _ = c.lua_setmetatable(LS, -2);
+    c.lua_pushvalue(LS, -1);
+    box.self_ref = c.luaL_ref(LS, c.LUA_REGISTRYINDEX);
     return 1;
 }
 
@@ -1413,9 +1435,39 @@ fn luaTimerStop(L: ?*c.lua_State) callconv(.c) c_int {
 fn luaTimerClose(L: ?*c.lua_State) callconv(.c) c_int {
     const LS: *c.lua_State = @ptrCast(L.?);
     if (boxFromSelf(LS)) |box| {
+        if (c.uv_is_closing(@ptrCast(&box.handle)) != 0) return 0;
         _ = c.uv_timer_stop(&box.handle);
         c.uv_close(@ptrCast(&box.handle), timerCloseCallback);
     }
+    return 0;
+}
+
+fn luaTimerIsClosing(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = boxFromSelf(LS) orelse {
+        c.lua_pushboolean(LS, 1);
+        return 1;
+    };
+    c.lua_pushboolean(LS, if (c.uv_is_closing(@ptrCast(&box.handle)) != 0) 1 else 0);
+    return 1;
+}
+
+fn luaTimerIsActive(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = boxFromSelf(LS) orelse return 0;
+    c.lua_pushboolean(LS, if (c.uv_is_active(@ptrCast(&box.handle)) != 0) 1 else 0);
+    return 1;
+}
+
+fn luaTimerRef(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    if (boxFromSelf(LS)) |box| c.uv_ref(@ptrCast(&box.handle));
+    return 0;
+}
+
+fn luaTimerUnref(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    if (boxFromSelf(LS)) |box| c.uv_unref(@ptrCast(&box.handle));
     return 0;
 }
 
@@ -1431,8 +1483,596 @@ fn timerCloseCallback(handle: [*c]c.uv_handle_t) callconv(.c) void {
     const box: *TimerBox = @ptrCast(@alignCast(handle[0].data.?));
     if (g_L) |L| {
         if (box.ref != c.LUA_NOREF) c.luaL_unref(L, c.LUA_REGISTRYINDEX, box.ref);
+        uvDetachObject(L, box.self_ref, "__handle");
     }
     std.heap.page_allocator.destroy(box);
+}
+
+// ------------------------------------------------- pipes, processes, checks
+// A luv-compatible subset (vim.uv.new_pipe / spawn / new_check) for vim.system,
+// gitsigns and friends. Objects are Lua tables holding a pointer to a UvBox;
+// the box is freed in the close callback.
+
+const UvKind = enum { pipe, process, check, fs_event };
+
+const UvBox = struct {
+    kind: UvKind,
+    h: extern union { pipe: c.uv_pipe_t, process: c.uv_process_t, check: c.uv_check_t, fs_event: c.uv_fs_event_t } = undefined,
+    cb_ref: c_int = c.LUA_NOREF, // read / exit / check callback
+    close_ref: c_int = c.LUA_NOREF,
+    self_ref: c_int = c.LUA_NOREF, // the Lua object; detached on close so stale calls are safe
+
+    fn handle(self: *UvBox) *c.uv_handle_t {
+        return @ptrCast(&self.h);
+    }
+    fn stream(self: *UvBox) *c.uv_stream_t {
+        return @ptrCast(&self.h.pipe);
+    }
+};
+
+fn uvBoxFromSelf(L: *c.lua_State, idx: c_int) ?*UvBox {
+    if (!c.lua_istable(L, idx)) return null;
+    _ = c.lua_getfield(L, idx, "__uvbox");
+    const ptr = c.lua_touserdata(L, -1);
+    c.lua_pop(L, 1);
+    if (ptr == null) return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn uvSetRef(L: *c.lua_State, ref: *c_int, idx: c_int) void {
+    if (ref.* != c.LUA_NOREF) c.luaL_unref(L, c.LUA_REGISTRYINDEX, ref.*);
+    ref.* = c.LUA_NOREF;
+    if (c.lua_isfunction(L, idx)) {
+        c.lua_pushvalue(L, idx);
+        ref.* = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
+    }
+}
+
+/// Calls the function at the top of the stack with nargs arguments below it; errors
+/// in callbacks are reported on stderr (Neovim reports them too) instead of lost.
+fn uvCall(L: *c.lua_State, nargs: c_int) void {
+    if (c.lua_pcall(L, nargs, 0, 0) != 0) {
+        const msg = c.lua_tolstring(L, -1, null);
+        if (msg != null) std.debug.print("Error executing luv callback:\n{s}\n", .{std.mem.span(msg)});
+        c.lua_pop(L, 1);
+    }
+}
+
+/// luv's failure convention: nil, "ENAME: message", "ENAME".
+fn uvPushFail(L: *c.lua_State, rc: c_int) c_int {
+    c.lua_pushnil(L);
+    _ = c.lua_pushfstring(L, "%s: %s", c.uv_err_name(rc), c.uv_strerror(rc));
+    c.lua_pushstring(L, c.uv_err_name(rc));
+    return 3;
+}
+
+fn uvPushObject(L: *c.lua_State, box: *UvBox) void {
+    c.lua_newtable(L);
+    c.lua_pushlightuserdata(L, box);
+    c.lua_setfield(L, -2, "__uvbox");
+    c.lua_newtable(L);
+    const common = [_]struct { n: [*:0]const u8, f: c.lua_CFunction }{
+        .{ .n = "close", .f = @ptrCast(&luaUvHandleClose) },
+        .{ .n = "is_closing", .f = @ptrCast(&luaUvHandleIsClosing) },
+        .{ .n = "is_active", .f = @ptrCast(&luaUvHandleIsActive) },
+        .{ .n = "ref", .f = @ptrCast(&luaUvHandleRef) },
+        .{ .n = "unref", .f = @ptrCast(&luaUvHandleUnref) },
+        .{ .n = "has_ref", .f = @ptrCast(&luaUvHandleHasRef) },
+    };
+    for (common) |m| {
+        c.lua_pushcfunction(L, m.f);
+        c.lua_setfield(L, -2, m.n);
+    }
+    switch (box.kind) {
+        .pipe => {
+            const ms = [_]struct { n: [*:0]const u8, f: c.lua_CFunction }{
+                .{ .n = "read_start", .f = @ptrCast(&luaUvReadStart) },
+                .{ .n = "read_stop", .f = @ptrCast(&luaUvReadStop) },
+                .{ .n = "write", .f = @ptrCast(&luaUvWrite) },
+                .{ .n = "shutdown", .f = @ptrCast(&luaUvShutdown) },
+            };
+            for (ms) |m| {
+                c.lua_pushcfunction(L, m.f);
+                c.lua_setfield(L, -2, m.n);
+            }
+        },
+        .process => {
+            c.lua_pushcfunction(L, luaUvProcessKill);
+            c.lua_setfield(L, -2, "kill");
+            c.lua_pushcfunction(L, luaUvProcessGetPid);
+            c.lua_setfield(L, -2, "get_pid");
+        },
+        .check => {
+            c.lua_pushcfunction(L, luaUvCheckStart);
+            c.lua_setfield(L, -2, "start");
+            c.lua_pushcfunction(L, luaUvCheckStop);
+            c.lua_setfield(L, -2, "stop");
+        },
+        .fs_event => {
+            c.lua_pushcfunction(L, luaUvFsEventStart);
+            c.lua_setfield(L, -2, "start");
+            c.lua_pushcfunction(L, luaUvFsEventStop);
+            c.lua_setfield(L, -2, "stop");
+        },
+    }
+    c.lua_pushvalue(L, -1);
+    c.lua_setfield(L, -2, "__index");
+    _ = c.lua_setmetatable(L, -2);
+    c.lua_pushvalue(L, -1);
+    box.self_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
+}
+
+/// After a close, the Lua object outlives the box: clear its pointer (field) so
+/// methods see a closed handle instead of freed memory.
+fn uvDetachObject(L: *c.lua_State, ref: c_int, field: [*:0]const u8) void {
+    if (ref == c.LUA_NOREF) return;
+    c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, ref);
+    c.lua_pushnil(L);
+    c.lua_setfield(L, -2, field);
+    c.lua_pop(L, 1);
+    c.luaL_unref(L, c.LUA_REGISTRYINDEX, ref);
+}
+
+fn uvNewBox(kind: UvKind) ?*UvBox {
+    const box = std.heap.c_allocator.create(UvBox) catch return null;
+    box.* = .{ .kind = kind };
+    return box;
+}
+
+fn uvBoxCloseCb(h: [*c]c.uv_handle_t) callconv(.c) void {
+    const box: *UvBox = @ptrCast(@alignCast(h[0].data.?));
+    if (g_L) |L| {
+        if (box.close_ref != c.LUA_NOREF) {
+            c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, box.close_ref);
+            uvCall(L, 0);
+            c.luaL_unref(L, c.LUA_REGISTRYINDEX, box.close_ref);
+        }
+        if (box.cb_ref != c.LUA_NOREF) c.luaL_unref(L, c.LUA_REGISTRYINDEX, box.cb_ref);
+        uvDetachObject(L, box.self_ref, "__uvbox");
+    }
+    std.heap.c_allocator.destroy(box);
+}
+
+fn luaUvHandleClose(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse return 0;
+    if (c.uv_is_closing(box.handle()) != 0) return 0;
+    uvSetRef(LS, &box.close_ref, 2);
+    c.uv_close(box.handle(), uvBoxCloseCb);
+    return 0;
+}
+
+fn luaUvHandleIsClosing(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse {
+        c.lua_pushboolean(LS, 1);
+        return 1;
+    };
+    c.lua_pushboolean(LS, if (c.uv_is_closing(box.handle()) != 0) 1 else 0);
+    return 1;
+}
+
+fn luaUvHandleIsActive(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse return 0;
+    c.lua_pushboolean(LS, if (c.uv_is_active(box.handle()) != 0) 1 else 0);
+    return 1;
+}
+
+fn luaUvHandleRef(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    if (uvBoxFromSelf(LS, 1)) |box| c.uv_ref(box.handle());
+    return 0;
+}
+
+fn luaUvHandleUnref(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    if (uvBoxFromSelf(LS, 1)) |box| c.uv_unref(box.handle());
+    return 0;
+}
+
+fn luaUvHandleHasRef(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse return 0;
+    c.lua_pushboolean(LS, if (c.uv_has_ref(box.handle()) != 0) 1 else 0);
+    return 1;
+}
+
+// --- pipes
+
+fn luaUvNewPipe(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const ipc: c_int = if (c.lua_toboolean(LS, 1) != 0) 1 else 0;
+    const box = uvNewBox(.pipe) orelse return uvPushFail(LS, c.UV_ENOMEM);
+    const rc = c.uv_pipe_init(getLoop(), &box.h.pipe, ipc);
+    if (rc != 0) {
+        std.heap.c_allocator.destroy(box);
+        return uvPushFail(LS, rc);
+    }
+    box.handle().data = box;
+    uvPushObject(LS, box);
+    return 1;
+}
+
+fn uvAllocCb(_: [*c]c.uv_handle_t, suggested: usize, buf: [*c]c.uv_buf_t) callconv(.c) void {
+    const mem = std.heap.c_allocator.alloc(u8, suggested) catch {
+        buf[0] = c.uv_buf_init(null, 0);
+        return;
+    };
+    buf[0] = c.uv_buf_init(mem.ptr, @intCast(mem.len));
+}
+
+fn uvReadCb(s: [*c]c.uv_stream_t, nread: isize, buf: [*c]const c.uv_buf_t) callconv(.c) void {
+    defer if (buf[0].base != null) std.heap.c_allocator.free(buf[0].base[0..buf[0].len]);
+    const box: *UvBox = @ptrCast(@alignCast(s[0].data.?));
+    const L = g_L orelse return;
+    if (nread == 0 or box.cb_ref == c.LUA_NOREF) return;
+    c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, box.cb_ref);
+    if (nread > 0) {
+        c.lua_pushnil(L);
+        c.lua_pushlstring(L, buf[0].base, @intCast(nread));
+    } else if (nread == c.UV_EOF) {
+        c.lua_pushnil(L);
+        c.lua_pushnil(L);
+    } else {
+        c.lua_pushstring(L, c.uv_err_name(@intCast(nread)));
+        c.lua_pushnil(L);
+    }
+    uvCall(L, 2);
+}
+
+fn luaUvReadStart(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse return 0;
+    uvSetRef(LS, &box.cb_ref, 2);
+    const rc = c.uv_read_start(box.stream(), uvAllocCb, uvReadCb);
+    if (rc != 0) return uvPushFail(LS, rc);
+    c.lua_pushinteger(LS, 0);
+    return 1;
+}
+
+fn luaUvReadStop(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse return 0;
+    _ = c.uv_read_stop(box.stream());
+    c.lua_pushinteger(LS, 0);
+    return 1;
+}
+
+const UvReq = struct {
+    u: extern union { write: c.uv_write_t, shutdown: c.uv_shutdown_t } = undefined,
+    data: []u8 = &.{},
+    ref: c_int = c.LUA_NOREF,
+};
+
+fn uvReqDone(req: *UvReq, status: c_int) void {
+    if (g_L) |L| {
+        if (req.ref != c.LUA_NOREF) {
+            c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, req.ref);
+            if (status < 0) c.lua_pushstring(L, c.uv_err_name(status)) else c.lua_pushnil(L);
+            uvCall(L, 1);
+            c.luaL_unref(L, c.LUA_REGISTRYINDEX, req.ref);
+        }
+    }
+    if (req.data.len > 0) std.heap.c_allocator.free(req.data);
+    std.heap.c_allocator.destroy(req);
+}
+
+fn uvWriteCb(r: [*c]c.uv_write_t, status: c_int) callconv(.c) void {
+    uvReqDone(@ptrCast(@alignCast(r[0].data.?)), status);
+}
+
+fn uvShutdownCb(r: [*c]c.uv_shutdown_t, status: c_int) callconv(.c) void {
+    uvReqDone(@ptrCast(@alignCast(r[0].data.?)), status);
+}
+
+/// pipe:write(data [, cb]): data is a string or a list of strings.
+fn luaUvWrite(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse return 0;
+    var list = std.ArrayList(u8).initCapacity(std.heap.c_allocator, 0) catch return uvPushFail(LS, c.UV_ENOMEM);
+    if (c.lua_istable(LS, 2)) {
+        var i: c_int = 1;
+        while (true) : (i += 1) {
+            c.lua_rawgeti(LS, 2, i);
+            if (c.lua_isnil(LS, -1)) {
+                c.lua_pop(LS, 1);
+                break;
+            }
+            var n: usize = 0;
+            const p = c.luaL_checklstring(LS, -1, &n);
+            list.appendSlice(std.heap.c_allocator, p[0..n]) catch {};
+            c.lua_pop(LS, 1);
+        }
+    } else {
+        var n: usize = 0;
+        const p = c.luaL_checklstring(LS, 2, &n);
+        list.appendSlice(std.heap.c_allocator, p[0..n]) catch {};
+    }
+    const req = std.heap.c_allocator.create(UvReq) catch return uvPushFail(LS, c.UV_ENOMEM);
+    req.* = .{ .data = list.toOwnedSlice(std.heap.c_allocator) catch &.{} };
+    req.u.write.data = req;
+    uvSetRef(LS, &req.ref, 3);
+    var buf = c.uv_buf_init(if (req.data.len > 0) req.data.ptr else null, @intCast(req.data.len));
+    const rc = c.uv_write(&req.u.write, box.stream(), &buf, 1, uvWriteCb);
+    if (rc != 0) {
+        if (req.ref != c.LUA_NOREF) c.luaL_unref(LS, c.LUA_REGISTRYINDEX, req.ref);
+        if (req.data.len > 0) std.heap.c_allocator.free(req.data);
+        std.heap.c_allocator.destroy(req);
+        return uvPushFail(LS, rc);
+    }
+    c.lua_pushinteger(LS, 0);
+    return 1;
+}
+
+fn luaUvShutdown(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse return 0;
+    const req = std.heap.c_allocator.create(UvReq) catch return uvPushFail(LS, c.UV_ENOMEM);
+    req.* = .{};
+    req.u.shutdown.data = req;
+    uvSetRef(LS, &req.ref, 2);
+    const rc = c.uv_shutdown(&req.u.shutdown, box.stream(), uvShutdownCb);
+    if (rc != 0) {
+        if (req.ref != c.LUA_NOREF) c.luaL_unref(LS, c.LUA_REGISTRYINDEX, req.ref);
+        std.heap.c_allocator.destroy(req);
+        return uvPushFail(LS, rc);
+    }
+    c.lua_pushinteger(LS, 0);
+    return 1;
+}
+
+// --- processes
+
+fn uvExitCb(p: [*c]c.uv_process_t, status: i64, signal: c_int) callconv(.c) void {
+    const box: *UvBox = @ptrCast(@alignCast(p[0].data.?));
+    const L = g_L orelse return;
+    if (box.cb_ref == c.LUA_NOREF) return;
+    c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, box.cb_ref);
+    c.lua_pushinteger(L, @intCast(status));
+    c.lua_pushinteger(L, signal);
+    uvCall(L, 2);
+}
+
+/// Signal number from an integer or a luv-style name ("sigterm", "SIGKILL", "term").
+fn uvSignal(L: *c.lua_State, idx: c_int, default: c_int) c_int {
+    if (c.lua_isnumber(L, idx) != 0) return @intCast(c.lua_tointeger(L, idx));
+    if (c.lua_isstring(L, idx) == 0) return default;
+    const raw = std.mem.span(c.lua_tolstring(L, idx, null));
+    var lower: [16]u8 = undefined;
+    if (raw.len > lower.len) return default;
+    for (raw, 0..) |ch, i| lower[i] = std.ascii.toLower(ch);
+    var name: []const u8 = lower[0..raw.len];
+    if (std.mem.startsWith(u8, name, "sig")) name = name[3..];
+    const S = std.posix.SIG;
+    const table = .{
+        .{ "hup", S.HUP }, .{ "int", S.INT }, .{ "quit", S.QUIT }, .{ "kill", S.KILL },
+        .{ "term", S.TERM }, .{ "usr1", S.USR1 }, .{ "usr2", S.USR2 }, .{ "pipe", S.PIPE },
+        .{ "alrm", S.ALRM }, .{ "chld", S.CHLD }, .{ "cont", S.CONT }, .{ "stop", S.STOP },
+        .{ "tstp", S.TSTP }, .{ "winch", S.WINCH },
+    };
+    inline for (table) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) return @intCast(@intFromEnum(entry[1]));
+    }
+    return default;
+}
+
+fn luaUvProcessKill(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse return 0;
+    const rc = c.uv_process_kill(&box.h.process, uvSignal(LS, 2, @intCast(@intFromEnum(std.posix.SIG.TERM))));
+    if (rc != 0) return uvPushFail(LS, rc);
+    c.lua_pushinteger(LS, 0);
+    return 1;
+}
+
+fn luaUvProcessGetPid(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse return 0;
+    c.lua_pushinteger(LS, box.h.process.pid);
+    return 1;
+}
+
+fn luaUvKill(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const pid: c_int = @intCast(c.luaL_checkinteger(LS, 1));
+    const rc = c.uv_kill(pid, uvSignal(LS, 2, @intCast(@intFromEnum(std.posix.SIG.TERM))));
+    if (rc != 0) return uvPushFail(LS, rc);
+    c.lua_pushinteger(LS, 0);
+    return 1;
+}
+
+/// Copies list entries of the table at idx into NUL-terminated strings, optionally
+/// with a leading string, ending with a null pointer (argv/envp layout).
+fn uvStringList(L: *c.lua_State, arena: std.mem.Allocator, idx: c_int, first: ?[*:0]const u8) ?[*c][*c]u8 {
+    var items = std.ArrayList([*c]u8).initCapacity(arena, 8) catch return null;
+    if (first) |f| items.append(arena, @constCast(f)) catch return null;
+    if (c.lua_istable(L, idx)) {
+        var i: c_int = 1;
+        while (true) : (i += 1) {
+            c.lua_rawgeti(L, idx, i);
+            defer c.lua_pop(L, 1);
+            if (c.lua_isnil(L, -1)) break;
+            var n: usize = 0;
+            const p = c.lua_tolstring(L, -1, &n) orelse continue;
+            const copy = arena.dupeSentinel(u8, p[0..n], 0) catch return null;
+            items.append(arena, copy.ptr) catch return null;
+        }
+    }
+    items.append(arena, null) catch return null;
+    return items.items.ptr;
+}
+
+/// uv.spawn(path, {args, stdio, env, cwd, detached, hide}, on_exit) -> handle, pid
+fn luaUvSpawn(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const path = c.luaL_checklstring(LS, 1, null);
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var opts: c.uv_process_options_t = std.mem.zeroes(c.uv_process_options_t);
+    opts.file = path;
+    opts.exit_cb = uvExitCb;
+    var stdio: [3]c.uv_stdio_container_t = std.mem.zeroes([3]c.uv_stdio_container_t);
+    opts.stdio = &stdio;
+    opts.stdio_count = 3;
+    for (&stdio) |*s| s.flags = c.UV_IGNORE;
+
+    if (c.lua_istable(LS, 2)) {
+        _ = c.lua_getfield(LS, 2, "args");
+        opts.args = uvStringList(LS, arena, c.lua_gettop(LS), path) orelse return uvPushFail(LS, c.UV_ENOMEM);
+        c.lua_pop(LS, 1);
+
+        _ = c.lua_getfield(LS, 2, "env");
+        if (c.lua_istable(LS, -1)) opts.env = uvStringList(LS, arena, c.lua_gettop(LS), null) orelse return uvPushFail(LS, c.UV_ENOMEM);
+        c.lua_pop(LS, 1);
+
+        _ = c.lua_getfield(LS, 2, "cwd");
+        if (c.lua_isstring(LS, -1) != 0) {
+            const cwd = std.mem.span(c.lua_tolstring(LS, -1, null));
+            opts.cwd = (arena.dupeSentinel(u8, cwd, 0) catch return uvPushFail(LS, c.UV_ENOMEM)).ptr;
+        }
+        c.lua_pop(LS, 1);
+
+        _ = c.lua_getfield(LS, 2, "detached");
+        if (c.lua_toboolean(LS, -1) != 0) opts.flags |= c.UV_PROCESS_DETACHED;
+        c.lua_pop(LS, 1);
+        _ = c.lua_getfield(LS, 2, "hide");
+        if (c.lua_toboolean(LS, -1) != 0) opts.flags |= c.UV_PROCESS_WINDOWS_HIDE;
+        c.lua_pop(LS, 1);
+
+        _ = c.lua_getfield(LS, 2, "stdio");
+        if (c.lua_istable(LS, -1)) {
+            const t = c.lua_gettop(LS);
+            for (&stdio, 0..) |*s, i| {
+                c.lua_rawgeti(LS, t, @intCast(i + 1));
+                defer c.lua_pop(LS, 1);
+                if (c.lua_isnumber(LS, -1) != 0) {
+                    s.flags = c.UV_INHERIT_FD;
+                    s.data.fd = @intCast(c.lua_tointeger(LS, -1));
+                } else if (uvBoxFromSelf(LS, c.lua_gettop(LS))) |pbox| {
+                    s.flags = c.UV_CREATE_PIPE | c.UV_READABLE_PIPE | c.UV_WRITABLE_PIPE;
+                    s.data.stream = pbox.stream();
+                }
+            }
+        }
+        c.lua_pop(LS, 1);
+    }
+    if (opts.args == null) opts.args = uvStringList(LS, arena, 0, path) orelse return uvPushFail(LS, c.UV_ENOMEM);
+
+    const box = uvNewBox(.process) orelse return uvPushFail(LS, c.UV_ENOMEM);
+    box.handle().data = box;
+    uvSetRef(LS, &box.cb_ref, 3);
+    const rc = c.uv_spawn(getLoop(), &box.h.process, &opts);
+    if (rc != 0) {
+        // libuv still initialised the handle; it must be closed, which frees the box.
+        c.uv_close(box.handle(), uvBoxCloseCb);
+        return uvPushFail(LS, rc);
+    }
+    uvPushObject(LS, box);
+    c.lua_pushinteger(LS, box.h.process.pid);
+    return 2;
+}
+
+// --- checks (run once per loop iteration)
+
+fn luaUvNewCheck(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvNewBox(.check) orelse return uvPushFail(LS, c.UV_ENOMEM);
+    const rc = c.uv_check_init(getLoop(), &box.h.check);
+    if (rc != 0) {
+        std.heap.c_allocator.destroy(box);
+        return uvPushFail(LS, rc);
+    }
+    box.handle().data = box;
+    uvPushObject(LS, box);
+    return 1;
+}
+
+fn uvCheckCb(h: [*c]c.uv_check_t) callconv(.c) void {
+    const box: *UvBox = @ptrCast(@alignCast(h[0].data.?));
+    const L = g_L orelse return;
+    if (box.cb_ref == c.LUA_NOREF) return;
+    c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, box.cb_ref);
+    uvCall(L, 0);
+}
+
+fn luaUvCheckStart(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse return 0;
+    uvSetRef(LS, &box.cb_ref, 2);
+    _ = c.uv_check_start(&box.h.check, uvCheckCb);
+    c.lua_pushinteger(LS, 0);
+    return 1;
+}
+
+// --- fs_event (directory/file watchers)
+
+fn luaUvNewFsEvent(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvNewBox(.fs_event) orelse return uvPushFail(LS, c.UV_ENOMEM);
+    const rc = c.uv_fs_event_init(getLoop(), &box.h.fs_event);
+    if (rc != 0) {
+        std.heap.c_allocator.destroy(box);
+        return uvPushFail(LS, rc);
+    }
+    box.handle().data = box;
+    uvPushObject(LS, box);
+    return 1;
+}
+
+fn uvFsEventCb(h: [*c]c.uv_fs_event_t, filename: [*c]const u8, events: c_int, status: c_int) callconv(.c) void {
+    const box: *UvBox = @ptrCast(@alignCast(h[0].data.?));
+    const L = g_L orelse return;
+    if (box.cb_ref == c.LUA_NOREF) return;
+    c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, box.cb_ref);
+    if (status < 0) c.lua_pushstring(L, c.uv_err_name(status)) else c.lua_pushnil(L);
+    if (filename != null) c.lua_pushstring(L, filename) else c.lua_pushnil(L);
+    c.lua_newtable(L);
+    if (events & c.UV_CHANGE != 0) {
+        c.lua_pushboolean(L, 1);
+        c.lua_setfield(L, -2, "change");
+    }
+    if (events & c.UV_RENAME != 0) {
+        c.lua_pushboolean(L, 1);
+        c.lua_setfield(L, -2, "rename");
+    }
+    uvCall(L, 3);
+}
+
+/// fs_event:start(path, {recursive=}, cb(err, filename, {change=, rename=}))
+fn luaUvFsEventStart(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse return 0;
+    const path = c.luaL_checklstring(LS, 2, null);
+    var flags: c_uint = 0;
+    if (c.lua_istable(LS, 3)) {
+        _ = c.lua_getfield(LS, 3, "recursive");
+        if (c.lua_toboolean(LS, -1) != 0) flags |= c.UV_FS_EVENT_RECURSIVE;
+        c.lua_pop(LS, 1);
+    }
+    uvSetRef(LS, &box.cb_ref, 4);
+    const rc = c.uv_fs_event_start(&box.h.fs_event, uvFsEventCb, path, flags);
+    if (rc != 0) return uvPushFail(LS, rc);
+    c.lua_pushinteger(LS, 0);
+    return 1;
+}
+
+fn luaUvFsEventStop(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse return 0;
+    _ = c.uv_fs_event_stop(&box.h.fs_event);
+    c.lua_pushinteger(LS, 0);
+    return 1;
+}
+
+fn luaUvCheckStop(L: ?*c.lua_State) callconv(.c) c_int {
+    const LS: *c.lua_State = @ptrCast(L.?);
+    const box = uvBoxFromSelf(LS, 1) orelse return 0;
+    _ = c.uv_check_stop(&box.h.check);
+    c.lua_pushinteger(LS, 0);
+    return 1;
 }
 
 fn luaUvVersion(L: ?*c.lua_State) callconv(.c) c_int {

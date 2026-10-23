@@ -119,6 +119,9 @@ function encode_value(v)
     if vim._empty_dict_mt and getmetatable(v) == vim._empty_dict_mt then
       return '{}'
     end
+    if next(v) == nil then
+      return '[]' -- like Neovim: only vim.empty_dict() encodes as {}
+    end
     local parts = {}
     if is_array(v) then
       for i = 1, #v do
@@ -2218,21 +2221,6 @@ end
 
 vim.loop = vim.uv
 
--- Handles that need a running libuv loop are inert for now.
-vim.uv.new_check = function()
-  local handle = {}
-  function handle.start()
-    return 0
-  end
-  function handle.stop()
-    return 0
-  end
-  function handle.close() end
-  function handle.is_active()
-    return false
-  end
-  return handle
-end
 -- luv returns times as { sec, nsec } tables; the Zig core returns only a number.
 -- shortcut: atime/ctime/birthtime reuse mtime, and mode/uid/ino are absent; upgrade
 -- when the core exposes the full struct stat.
@@ -3708,10 +3696,20 @@ do
     return { value }
   end
 
+  -- Event names are case-insensitive and Vim's aliases map to one canonical event.
+  local canonical_event = {}
+  for name in pairs(known_events) do
+    canonical_event[name:lower()] = name
+  end
+  for alias, name in pairs({ bufcreate = 'BufAdd', bufread = 'BufReadPost', bufwrite = 'BufWritePre', fileencoding = 'EncodingChanged' }) do
+    canonical_event[alias] = name
+  end
+
   local function validate_events(events)
-    local list = as_list(events)
-    for _, event in ipairs(list) do
-      if not known_events[event] then
+    local list = {}
+    for i, event in ipairs(as_list(events)) do
+      list[i] = canonical_event[tostring(event):lower()]
+      if not list[i] then
         api_error("Invalid 'event': '" .. tostring(event) .. "'")
       end
     end
@@ -4234,10 +4232,9 @@ do
     end
     if opts.name ~= nil then
       local group = highlight_groups[opts.name]
-      if not group then
-        return {}
-      end
-      return get(group)
+      local hl = group and get(group)
+      -- an API Dict: empty results are vim.empty_dict(), like Neovim
+      return (hl and next(hl) ~= nil) and hl or vim.empty_dict()
     end
     local out = {}
     for name, group in pairs(highlight_groups) do
@@ -5857,3 +5854,11 @@ end
 
 -- Built-in highlight groups, as Neovim has before any colorscheme.
 vim._hl_reset()
+
+-- vim.diff (Neovim: xdiff in C); vim.text.diff calls it.
+function vim.diff(a, b, opts)
+  return require('vim._diff').diff(a, b, opts)
+end
+
+-- vim.system(), as vim._init_packages loads it (built on vim.uv.spawn / new_pipe).
+require('vim._core.system')
