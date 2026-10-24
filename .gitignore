@@ -38,3 +38,7 @@ session/archive/
 # Neovim runtime (fetched via scripts/fetch-runtime.sh)
 # This is 3.3MB of Neovim's code - should not be committed
 runtime/lua/
+runtime/queries/
+runtime/parser/
+runtime/ftplugin/
+runtime/indent/

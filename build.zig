@@ -61,6 +61,16 @@ pub fn build(b: *std.Build) void {
         .files = &.{ "lpcap.c", "lpcode.c", "lpcset.c", "lpprint.c", "lptree.c", "lpvm.c" },
         .flags = &.{ "-std=c99", "-DNDEBUG" },
     });
+    // tree-sitter (vendored, deps/tree-sitter, the version Neovim 0.12.6 pins) and Neovim's
+    // Lua bindings for it (src/c/treesitter.c).
+    exe.root_module.addCSourceFile(.{ .file = b.path("deps/tree-sitter/src/lib.c"), .flags = &.{ "-std=c11", "-DNDEBUG", "-D_POSIX_C_SOURCE=200112L", "-D_DEFAULT_SOURCE" } });
+    exe.root_module.addCSourceFile(.{ .file = b.path("src/c/treesitter.c"), .flags = &.{ "-std=gnu99", "-DNDEBUG" } });
+    exe.root_module.addIncludePath(b.path("deps/tree-sitter/include"));
+    exe.root_module.addIncludePath(b.path("deps/tree-sitter/src"));
+    if (os_tag == .macos) {
+        exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        exe.root_module.addIncludePath(.{ .cwd_relative = "/usr/local/include" });
+    }
     if (os_tag == .macos) {
         exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/luajit-2.1" });
         exe.root_module.addIncludePath(.{ .cwd_relative = "/usr/local/include/luajit-2.1" });

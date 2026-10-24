@@ -292,6 +292,9 @@ pub fn main(init: std.process.Init) !void {
     registerEmbeddedModules(L);
     try registerVimGlobal(L);
     registerLpeg(L);
+    c.lua_getglobal(L, "vim");
+    c.nlua_treesitter_init(L);
+    c.lua_pop(L, 1);
     try loadPrelude(L);
     try loadTui(L);
 
@@ -843,6 +846,26 @@ fn luaPathType(L: ?*c.lua_State) callconv(.c) c_int {
         c.lua_pushstring(LS, "other");
     }
     return 1;
+}
+
+// Buffer reads for the tree-sitter parser (src/c/ts_shim.h).
+export fn zv_buf_line_count(bufnr: i64) i64 {
+    if (g_store) |*s| {
+        if (s.isValid(resolveBufId(bufnr))) return @intCast(s.lineCount(resolveBufId(bufnr)));
+    }
+    return -1;
+}
+
+export fn zv_buf_get_line(bufnr: i64, row: i64, len: *usize) [*]const u8 {
+    if (g_store) |*s| {
+        const lines = s.getLines(resolveBufId(bufnr), row, row + 1) catch &[_][]u8{};
+        if (lines.len > 0) {
+            len.* = lines[0].len;
+            return lines[0].ptr;
+        }
+    }
+    len.* = 0;
+    return "";
 }
 
 fn resolveBufId(id: i64) u32 {

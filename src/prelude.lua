@@ -905,7 +905,12 @@ vim.bo = setmetatable({}, {
 -- Window-local options (a single window for now).
 local window_options = alias_table({})
 vim.wo = setmetatable({}, {
-  __index = function(_, k)
+  __index = function(t, k)
+    -- vim.wo[winid] and vim.wo[winid][bufnr]
+    -- shortcut: one set of window options shared by all windows, upgrade with per-window options.
+    if type(k) == 'number' then
+      return t
+    end
     check_option(k)
     local v = window_options[k]
     if v ~= nil then
@@ -2227,6 +2232,45 @@ local function fire_buf_attach(buf, firstline, lastline, new_lastline, byte_coun
       end
     end
   end
+end
+
+-- on_bytes(…, start_row, start_col, start_byte, old_end_row, old_end_col, old_end_byte,
+-- new_end_row, new_end_col, new_end_byte) for every attached on_bytes callback.
+local function fire_buf_bytes(buf, ...)
+  local callbacks = buffer_attach_callbacks[buf]
+  if not callbacks then
+    return
+  end
+  for i = #callbacks, 1, -1 do
+    local opts = callbacks[i]
+    if opts.on_bytes then
+      local tick = vim.api.nvim_buf_get_changedtick and vim.api.nvim_buf_get_changedtick(buf) or 0
+      local ok, res = pcall(opts.on_bytes, 'bytes', buf, tick, ...)
+      if not ok then
+        vim.notify('Error in on_bytes callback: ' .. tostring(res), vim.log.levels.ERROR)
+      elseif res == true then
+        table.remove(callbacks, i)
+      end
+    end
+  end
+end
+
+-- Bytes before 0-based `row`, newlines included (only computed when someone listens).
+local function byte_offset(buf, row)
+  local n = 0
+  for _, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, row, false)) do
+    n = n + #l + 1
+  end
+  return n
+end
+
+local function has_on_bytes(buf)
+  for _, opts in ipairs(buffer_attach_callbacks[buf] or {}) do
+    if opts.on_bytes then
+      return true
+    end
+  end
+  return false
 end
 
 vim.api.nvim_win_call = function(win, fn)
@@ -4124,6 +4168,7 @@ do
   end
 
   local raw_set_lines = vim.api.nvim_buf_set_lines
+  local set_text_active = false -- nvim_buf_set_text reports its own, column-exact on_bytes
   vim.api.nvim_buf_set_lines = function(buf, start, end_, strict, lines)
     local id = check_buf(buf)
     -- on_lines gets resolved 0-based lines like Neovim (-1 means past the last line)
@@ -4137,6 +4182,8 @@ do
     start, end_ = math.min(start, n), math.min(end_, n)
     -- on_lines' byte_count: size of the replaced lines, newlines included
     local byte_count = 0
+    local want_bytes = not set_text_active and has_on_bytes(id)
+    local start_byte = want_bytes and byte_offset(id, start) or 0
     if buffer_attach_callbacks[id] and end_ > start then
       for _, l in ipairs(vim.api.nvim_buf_get_lines(id, start, end_, false)) do
         byte_count = byte_count + #l + 1
@@ -4151,10 +4198,46 @@ do
       end
     end
     fire_buf_attach(id, start, end_, start + count, byte_count)
+    if want_bytes then
+      local new_bytes = 0
+      for _, l in ipairs(lines or {}) do
+        new_bytes = new_bytes + #l + 1
+      end
+      fire_buf_bytes(id, start, 0, start_byte, end_ - start, 0, byte_count, count, 0, new_bytes)
+    end
     return result
   end
 
   -- nvim_buf_set_text: replace a (0-based, end-exclusive col) range with {replacement} lines.
+  vim.api.nvim_buf_get_text = function(buf, start_row, start_col, end_row, end_col, opts)
+    local id = check_buf(buf)
+    local n = vim.api.nvim_buf_line_count(id)
+    if start_row < 0 then start_row = n + start_row end
+    if end_row < 0 then end_row = n + end_row end
+    if start_row < 0 or start_row >= n or end_row < 0 or end_row >= n then
+      api_error('Index out of bounds')
+    end
+    if start_row > end_row then
+      api_error("'start' is higher than 'end'")
+    end
+    local lines = vim.api.nvim_buf_get_lines(id, start_row, end_row + 1, true)
+    -- negative columns count from past the end of the line (-1 is the end)
+    local function col(c, line)
+      if c < 0 then c = #line + 1 + c end
+      return math.max(0, math.min(c, #line))
+    end
+    local sc, ec = col(start_col, lines[1]), col(end_col, lines[#lines])
+    if #lines == 1 then
+      if sc > ec then
+        api_error("'start' is higher than 'end'")
+      end
+      return { lines[1]:sub(sc + 1, ec) }
+    end
+    lines[1] = lines[1]:sub(sc + 1)
+    lines[#lines] = lines[#lines]:sub(1, ec)
+    return lines
+  end
+
   vim.api.nvim_buf_set_text = function(buf, start_row, start_col, end_row, end_col, replacement)
     local id = check_buf(buf)
     local n = vim.api.nvim_buf_line_count(id)
@@ -4178,9 +4261,28 @@ do
     if #new == 0 then
       new[1] = ''
     end
+    local want_bytes = has_on_bytes(id)
+    local start_byte, old_bytes, new_bytes = 0, 0, 0
+    if want_bytes then
+      start_byte = byte_offset(id, start_row) + start_col
+      local removed = vim.api.nvim_buf_get_text(id, start_row, start_col, end_row, end_col, {})
+      old_bytes = #table.concat(removed, '\n')
+      new_bytes = #table.concat(new, '\n')
+    end
+    local nrep = #new
+    local last_rep = #new[nrep]
     new[1] = first:sub(1, start_col) .. new[1]
     new[#new] = new[#new] .. last:sub(end_col + 1)
-    vim.api.nvim_buf_set_lines(id, start_row, end_row + 1, true, new)
+    set_text_active = true
+    local ok, err = pcall(vim.api.nvim_buf_set_lines, id, start_row, end_row + 1, true, new)
+    set_text_active = false
+    if not ok then
+      error(err, 0)
+    end
+    if want_bytes then
+      local old_col = end_row == start_row and end_col - start_col or end_col
+      fire_buf_bytes(id, start_row, start_col, start_byte, end_row - start_row, old_col, old_bytes, nrep - 1, last_rep, new_bytes)
+    end
   end
 
   vim.api.nvim_buf_get_short_name = function(buf, _)
@@ -4743,6 +4845,7 @@ do
   local highlight_groups = {}
   local next_hl_id = 1
   local hl_ids = {}
+  local hl_names = {}
 
   vim.api.nvim_get_hl_id_by_name = function(name)
     local id = hl_ids[name]
@@ -4750,8 +4853,28 @@ do
       id = next_hl_id
       next_hl_id = next_hl_id + 1
       hl_ids[name] = id
+      hl_names[id] = name
     end
     return id
+  end
+
+  -- For the TUI: the group drawn for a name or id. Like Neovim, an undefined "@a.b.c"
+  -- falls back to "@a.b", then "@a"; links are followed. nil when nothing is defined.
+  function vim._hl_resolve(name)
+    if type(name) == 'number' then
+      name = hl_names[name]
+    end
+    while name do
+      local group = highlight_groups[name]
+      if group and next(group) ~= nil then
+        local seen = 0
+        while group.link and seen < 100 do
+          group, seen = highlight_groups[group.link] or {}, seen + 1
+        end
+        return group
+      end
+      name = name:match('^(.+)%.[^.]+$')
+    end
   end
 
   vim.api.nvim_set_hl = function(ns, name, val)
@@ -4858,6 +4981,9 @@ do
     end
     local function get(group)
       return copy_group(opts.link == false and resolve(group) or group)
+    end
+    if opts.id ~= nil and opts.name == nil then
+      opts = vim.tbl_extend('force', opts, { name = hl_names[opts.id] or '' })
     end
     if opts.name ~= nil then
       local group = highlight_groups[opts.name]
@@ -4994,42 +5120,6 @@ do
         return lib
       end
     end
-    -- shortcut: no tree-sitter C library, so the real vim.treesitter cannot load;
-    -- behave like Neovim with no parsers installed. Upgrade when parsers can run.
-    if k == 'treesitter' then
-      local none = function() end
-      local stub = {
-        highlighter = { active = {} },
-        start = none,
-        stop = none,
-        get_parser = function()
-          return nil, 'no parser available'
-        end,
-        get_node = none,
-        get_captures_at_pos = function()
-          return {}
-        end,
-        foldexpr = function()
-          return '0'
-        end,
-        language = {
-          add = function()
-            return false
-          end,
-          get_lang = function(ft)
-            return ft
-          end,
-          register = none,
-        },
-        query = {
-          get = none, parse = none, set = none,
-          add_predicate = none, add_directive = none,
-          list_predicates = function() return {} end, list_directives = function() return {} end,
-        },
-      }
-      rawset(t, k, stub)
-      return stub
-    end
     -- Like vim._init_packages: vim.uri_* from vim.uri, inspect_pos/show_pos from vim._inspector.
     if type(k) == 'string' and k:sub(1, 4) == 'uri_' then
       local val = require('vim.uri')[k]
@@ -5073,6 +5163,19 @@ do
 
   vim.api.nvim_buf_set_extmark = function(buf, ns, line, col, opts)
     opts = opts or {}
+    -- ephemeral marks live for one redraw: the TUI collects them while providers run
+    if opts.ephemeral then
+      local list = vim._decor_ephemeral
+      if not list then
+        api_error('cannot set emphemeral mark outside of a decoration provider')
+      end
+      list[#list + 1] = {
+        row = line, col = col, end_row = opts.end_row or line, end_col = opts.end_col or col,
+        hl_group = opts.hl_group, priority = opts.priority or 4096, virt_text = opts.virt_text,
+        virt_text_pos = opts.virt_text_pos,
+      }
+      return opts.id or 0
+    end
     vim._ui_gen = vim._ui_gen + 1
     local marks = ns_marks(buf, ns)
     local id = opts.id or next_extmark_id

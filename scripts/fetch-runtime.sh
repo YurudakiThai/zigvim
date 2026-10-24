@@ -57,6 +57,20 @@ fi
 echo "Extracting runtime/lua..."
 tar -xzf "$TMP_FILE" -C "$RUNTIME_DIR" --strip-components=4 "nvim-${PLATFORM}-${ARCH}/share/nvim/runtime/lua"
 
+# tree-sitter: Neovim's bundled queries and parsers (runtime/parser is on 'runtimepath')
+echo "Extracting runtime/queries and parsers..."
+tar -xzf "$TMP_FILE" -C "$RUNTIME_DIR" --strip-components=4 "nvim-${PLATFORM}-${ARCH}/share/nvim/runtime/queries"
+tar -xzf "$TMP_FILE" -C "$RUNTIME_DIR" --strip-components=3 "nvim-${PLATFORM}-${ARCH}/lib/nvim/parser"
+
+# Lua ftplugin/indent files (zigvim sources only the .lua ones; lua/markdown/help/query start tree-sitter)
+FT_TMP="$(mktemp -d)"
+tar -xzf "$TMP_FILE" -C "$FT_TMP" --strip-components=4 "nvim-${PLATFORM}-${ARCH}/share/nvim/runtime/ftplugin" "nvim-${PLATFORM}-${ARCH}/share/nvim/runtime/indent"
+for sub in ftplugin indent; do
+  mkdir -p "$RUNTIME_DIR/$sub"
+  cp "$FT_TMP/$sub"/*.lua "$RUNTIME_DIR/$sub/"
+done
+rm -rf "$FT_TMP"
+
 rm "$TMP_FILE"
 
 echo "✅ Neovim v$NVIM_VERSION runtime installed to $LUA_DIR"

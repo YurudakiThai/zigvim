@@ -12,5 +12,8 @@
 // Vendored LPeg (deps/lpeg)
 int luaopen_lpeg(lua_State *L);
 
+// Neovim's tree-sitter bindings (src/c/treesitter.c): sets vim._ts_* on the table at the top.
+void nlua_treesitter_init(lua_State *L);
+
 // lua_pushcfunction is a macro in Lua, define it here for Zig
 #define lua_pushcfunction(L, f) lua_pushcclosure(L, f, 0)

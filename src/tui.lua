@@ -394,10 +394,12 @@ local function truncate(s, width)
   return table.concat(out)
 end
 
-local function render_line(s, left, width, selfn)
+-- `hl` (optional) maps a 0-based byte to the escape for its highlight ('' for none).
+local function render_line(s, left, width, selfn, hl)
   local cs = cells(s)
   local buf = {}
   local rev = false
+  local cur = ''
   for _, c in ipairs(cs) do
     local cstart, cend = c.d, c.d + c.w
     if cend > left and cstart < left + width and c.w > 0 then
@@ -407,20 +409,18 @@ local function render_line(s, left, width, selfn)
         local to = math.min(cend, left + width)
         text = (' '):rep(to - from)
       end
-      local hl = selfn and selfn(c.b) or false
-      if hl and not rev then
-        buf[#buf + 1] = '\27[7m'
-        rev = true
-      elseif not hl and rev then
-        buf[#buf + 1] = '\27[0m'
-        rev = false
+      local sel = selfn and selfn(c.b) or false
+      local esc = hl and hl[c.b] or ''
+      if sel ~= rev or esc ~= cur then
+        buf[#buf + 1] = '\27[0m' .. esc .. (sel and '\27[7m' or '')
+        rev, cur = sel, esc
       end
       buf[#buf + 1] = text
     elseif c.w == 0 and cstart >= left and cstart <= left + width then
       buf[#buf + 1] = c.t
     end
   end
-  if rev then
+  if rev or cur ~= '' then
     buf[#buf + 1] = '\27[0m'
   end
   return table.concat(buf)
@@ -447,6 +447,7 @@ local function run_decoration_providers(top, bot)
     return
   end
   S.tick = (S.tick or 0) + 1
+  vim._decor_ephemeral = S.ephemeral
   local win, buf = api.nvim_get_current_win(), api.nvim_get_current_buf()
   local ids = vim.tbl_keys(providers)
   table.sort(ids)
@@ -469,11 +470,28 @@ local function run_decoration_providers(top, bot)
           pcall(p.on_line, 'line', win, buf, row)
         end
       end
+      -- on_range, one whole line at a time; a returned (row, col) skips calls until there,
+      -- false or an error stops calls for this window (Neovim's decor_providers_invoke_range).
+      -- shortcut: whole lines only, Neovim may also split a long line into column ranges.
+      if wok and wres ~= false and p.on_range then
+        local skip_row, skip_col = -1, 0
+        for row = top - 1, bot - 1 do
+          if not (skip_row > row + 1 or (skip_row == row + 1 and skip_col >= 0)) then
+            local rok, r1, r2 = pcall(p.on_range, 'range', win, buf, row, 0, row + 1, 0)
+            if not rok or r1 == false then
+              break
+            elseif type(r1) == 'number' then
+              skip_row, skip_col = r1, type(r2) == 'number' and r2 or 0
+            end
+          end
+        end
+      end
       if p.on_end then
         pcall(p.on_end, 'end', S.tick)
       end
     end
   end
+  vim._decor_ephemeral = nil
 end
 
 -- Width of the sign column from 'signcolumn' ("yes", "yes:N", "auto", "auto:M-N", "no").
@@ -524,15 +542,42 @@ local function collect_virt_text(top, bot)
   return by_row
 end
 
+local attr_codes = { bold = '1', italic = '3', underline = '4', undercurl = '4:3', strikethrough = '9', reverse = '7' }
+
 local function hl_escape(name)
-  if not name then
+  if not name or name == 0 then
     return ''
   end
-  local ok, hl = pcall(api.nvim_get_hl, 0, { name = name, link = false })
-  if not ok or not hl then
+  local hl = vim._hl_resolve(name)
+  if not hl then
     return ''
   end
   local esc = ''
+  -- without 'termguicolors' Neovim draws the cterm attributes and 16/256-color numbers
+  local gui = vim.o.termguicolors
+  local attrs = gui and hl or (hl.cterm or {})
+  for attr, code in pairs(attr_codes) do
+    if attrs[attr] then
+      esc = esc .. '\27[' .. code .. 'm'
+    end
+  end
+  if not gui then
+    local function cterm(n, base)
+      if n < 8 then
+        return '\27[' .. (base + n) .. 'm'
+      elseif n < 16 then
+        return '\27[' .. (base + 60 + n - 8) .. 'm'
+      end
+      return '\27[' .. (base + 8) .. ';5;' .. n .. 'm'
+    end
+    if hl.ctermfg then
+      esc = esc .. cterm(hl.ctermfg, 30)
+    end
+    if hl.ctermbg then
+      esc = esc .. cterm(hl.ctermbg, 40)
+    end
+    return esc
+  end
   if hl.fg then
     esc = esc .. string.format('\27[38;2;%d;%d;%dm', math.floor(hl.fg / 65536) % 256, math.floor(hl.fg / 256) % 256, hl.fg % 256)
   end
@@ -540,6 +585,51 @@ local function hl_escape(name)
     esc = esc .. string.format('\27[48;2;%d;%d;%dm', math.floor(hl.bg / 65536) % 256, math.floor(hl.bg / 256) % 256, hl.bg % 256)
   end
   return esc
+end
+
+-- Per visible row (0-based): byte -> escape of the winning highlight (higher priority wins,
+-- later marks win ties), from 'hl_group' extmarks and this redraw's ephemeral marks.
+-- shortcut: no blending of fg/bg between overlapping groups; the winner's group is drawn alone.
+local function collect_highlights(top, bot, lines)
+  local marks = {}
+  for _, m in ipairs(api.nvim_buf_get_extmarks(0, -1, { top - 1, 0 }, { bot - 1, -1 }, { details = true, type = 'highlight', overlap = true })) do
+    local d = m[4]
+    marks[#marks + 1] = { row = m[2], col = m[3], end_row = d.end_row or m[2], end_col = d.end_col or m[3], hl_group = d.hl_group, priority = d.priority or 4096 }
+  end
+  for _, m in ipairs(S.ephemeral) do
+    if m.hl_group then
+      marks[#marks + 1] = m
+    end
+  end
+  if #marks == 0 then
+    return {}
+  end
+  local cache, by_row, prio = {}, {}, {}
+  for _, m in ipairs(marks) do
+    local esc = cache[m.hl_group]
+    if not esc then
+      esc = hl_escape(m.hl_group)
+      cache[m.hl_group] = esc
+    end
+    if esc ~= '' then
+      for row = math.max(m.row, top - 1), math.min(m.end_row, bot - 1) do
+        local line = lines[row - top + 2] or ''
+        local from = row == m.row and m.col or 0
+        local to = row == m.end_row and m.end_col or #line
+        local map, pr = by_row[row], prio[row]
+        if not map then
+          map, pr = {}, {}
+          by_row[row], prio[row] = map, pr
+        end
+        for b = from, math.min(to, #line) - 1 do
+          if not pr[b] or m.priority >= pr[b] then
+            map[b], pr[b] = esc, m.priority
+          end
+        end
+      end
+    end
+  end
+  return by_row
 end
 
 local function draw()
@@ -587,6 +677,7 @@ local function draw()
   local lines = api.nvim_buf_get_lines(0, S.top - 1, S.top - 1 + textrows, false)
   local bot = math.min(n, S.top + textrows - 1)
   pcall(api.nvim_win_set_cursor, 0, { S.row, S.col })
+  S.ephemeral = {}
   run_decoration_providers(S.top, bot)
   if sw == 0 then
     sw = sign_width() -- providers may have placed the first sign ('signcolumn' auto)
@@ -594,6 +685,7 @@ local function draw()
   end
   local signs = sw > 0 and collect_signs(S.top, bot) or {}
   local vtext = collect_virt_text(S.top, bot)
+  local hls = collect_highlights(S.top, bot, lines)
   local vr1, vc1, vr2, vc2
   if S.mode == 'v' or S.mode == 'V' then
     vr1, vc1, vr2, vc2 = visual_bounds()
@@ -646,7 +738,7 @@ local function draw()
           end
         end
       end
-      out[#out + 1] = render_line(text, S.left, textcols, selfn)
+      out[#out + 1] = render_line(text, S.left, textcols, selfn, hls[lnum - 1])
       local vt = vtext[lnum - 1]
       if vt then
         local _, total = cells(text)
